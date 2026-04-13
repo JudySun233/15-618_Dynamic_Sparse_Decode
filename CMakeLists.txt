@@ -7,6 +7,7 @@ include(CheckLanguage)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
 
 option(DSD_ENABLE_CUDA "Build CUDA targets when a CUDA toolkit is available" ON)
 set(DSD_CUDA_ARCHITECTURES "90" CACHE STRING "CUDA architectures for device code")
@@ -25,9 +26,14 @@ if(DSD_ENABLE_CUDA AND CMAKE_CUDA_COMPILER)
   set(DSD_HAVE_CUDA ON)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
+  get_filename_component(DSD_CUDA_BIN_DIR "${CMAKE_CUDA_COMPILER}" DIRECTORY)
+  get_filename_component(DSD_CUDA_ROOT_DIR "${DSD_CUDA_BIN_DIR}/.." ABSOLUTE)
+  set(DSD_CUDA_INCLUDE_DIR "${DSD_CUDA_ROOT_DIR}/include")
+  set(DSD_CUDA_LIBRARY_DIR "${DSD_CUDA_ROOT_DIR}/lib64")
   set(CMAKE_CUDA_ARCHITECTURES ${DSD_CUDA_ARCHITECTURES})
 else()
   list(APPEND DSD_CORE_SOURCES src/cuda_dense_attention_stub.cpp)
+  list(APPEND DSD_CORE_SOURCES src/cuda_sparse_attention_stub.cpp)
 endif()
 
 add_library(dsd_core
@@ -59,16 +65,21 @@ if(DSD_HAVE_CUDA)
   add_library(dsd_cuda
     src/device_page_pool.cpp
     src/cuda/kernels.cu
+    src/cuda/sparse_attention.cu
   )
+
+  set_source_files_properties(src/device_page_pool.cpp PROPERTIES LANGUAGE CUDA)
 
   set_target_properties(dsd_cuda PROPERTIES
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON
+    CUDA_RUNTIME_LIBRARY Shared
   )
 
-  target_include_directories(dsd_cuda PUBLIC ${PROJECT_SOURCE_DIR}/include)
+  target_include_directories(dsd_cuda PUBLIC ${PROJECT_SOURCE_DIR}/include ${DSD_CUDA_INCLUDE_DIR})
+  target_link_directories(dsd_cuda PUBLIC ${DSD_CUDA_LIBRARY_DIR})
   target_compile_definitions(dsd_cuda PUBLIC DSD_HAVE_CUDA=1)
-  target_link_libraries(dsd_cuda PUBLIC CUDA::cudart)
+  target_link_libraries(dsd_cuda PUBLIC ${DSD_CUDA_LIBRARY_DIR}/libcudart.so ${DSD_CUDA_LIBRARY_DIR}/libcudadevrt.a)
   target_link_libraries(dsd_core PUBLIC dsd_cuda)
 
   add_executable(dsd_device_page_pool_test tests/test_device_page_pool.cpp)
@@ -79,6 +90,10 @@ if(DSD_HAVE_CUDA)
   target_link_libraries(dsd_dense_cuda_test PRIVATE dsd_core)
   add_test(NAME dsd_dense_cuda_test COMMAND dsd_dense_cuda_test)
 
+  add_executable(dsd_sparse_cuda_test tests/test_sparse_cuda.cpp)
+  target_link_libraries(dsd_sparse_cuda_test PRIVATE dsd_core)
+  add_test(NAME dsd_sparse_cuda_test COMMAND dsd_sparse_cuda_test)
+
   set(DSD_CUDA_BUILD_RPATH "$<TARGET_FILE_DIR:CUDA::cudart>")
   set_target_properties(
     dsd_demo
@@ -87,6 +102,7 @@ if(DSD_HAVE_CUDA)
     dsd_reference_test
     dsd_device_page_pool_test
     dsd_dense_cuda_test
+    dsd_sparse_cuda_test
     PROPERTIES BUILD_RPATH "${DSD_CUDA_BUILD_RPATH}")
 else()
   target_compile_definitions(dsd_core PUBLIC DSD_HAVE_CUDA=0)

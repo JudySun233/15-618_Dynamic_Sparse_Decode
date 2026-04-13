@@ -3,6 +3,7 @@
 #include <vector>
 
 #include "dsd/cuda_dense_attention.h"
+#include "dsd/cuda_sparse_attention.h"
 #include "dsd/profiler.h"
 
 namespace dsd {
@@ -59,6 +60,38 @@ AttentionResult DecodePipeline::RunDenseStepCuda(
     return {};
   }
   return batch_result.outputs.front();
+}
+
+SparseDecodeResult DecodePipeline::RunNaiveSparseStepCuda(
+    const PagedKvCache& cache,
+    const RequestState& request) const {
+  SparseDecodeResult result;
+  result.request_id = request.request_id;
+
+  {
+    ScopedStageTimer total_timer(&result.timings.total_ms);
+
+    {
+      ScopedStageTimer stage_timer(&result.timings.page_scoring_ms);
+      result.scores = ScorePagesCpu(cache, request, config_);
+    }
+
+    {
+      ScopedStageTimer stage_timer(&result.timings.topk_ms);
+      result.selected_page_ids =
+          SelectTopKPagesCpu(result.scores, config_.top_k_pages);
+    }
+
+    result.output = SparseAttentionCuda(
+        cache,
+        request.query,
+        result.selected_page_ids,
+        config_,
+        &result.timings.gather_ms,
+        &result.timings.attention_ms);
+  }
+
+  return result;
 }
 
 DenseBatchResult DecodePipeline::RunDenseBatchCuda(

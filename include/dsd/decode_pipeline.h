@@ -25,6 +25,10 @@ class DecodePipeline {
       const PagedKvCache& cache,
       const RequestState& request) const;
 
+  SparseDecodeResult RunNaiveSparseStepCuda(
+      const PagedKvCache& cache,
+      const RequestState& request) const;
+
   DenseBatchResult RunDenseBatchCuda(
       const PagedKvCache& cache,
       const std::vector<RequestState>& requests) const;
