@@ -6,6 +6,7 @@
 
 ## Project Documents
 - [Proposal](https://drive.google.com/file/d/1fHH5PrYwscMxC24i6ncw-auUZfnq9JzB/view?usp=sharing)
+- [Milestone Report](https://drive.google.com/file/d/1VijTbikrY2i88_Sm0u1dNoGkF70GW7i0/view?usp=sharing)
 
 ## What This Repo Is For
 This repository is a research prototype for long-context decode on GPUs.
