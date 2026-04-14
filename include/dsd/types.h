@@ -30,9 +30,20 @@ struct AttentionResult {
   std::vector<float> output;
 };
 
+struct RuntimeOverheadTimings {
+  double time_malloc_ms = 0.0;
+  double time_memcpy_h2d_ms = 0.0;
+  double time_memcpy_d2h_ms = 0.0;
+  double time_free_ms = 0.0;
+  double time_kernel_launch_ms = 0.0;
+  double time_sync_ms = 0.0;
+  double time_prepare_sparse_layout_ms = 0.0;
+};
+
 struct DenseBatchResult {
   std::vector<AttentionResult> outputs;
   double kernel_ms = 0.0;
+  RuntimeOverheadTimings runtime_overheads;
 };
 
 struct StageTimings {
@@ -49,6 +60,7 @@ struct SparseDecodeResult {
   std::vector<PageId> selected_page_ids;
   AttentionResult output;
   StageTimings timings;
+  RuntimeOverheadTimings runtime_overheads;
 };
 
 struct BatchDecodeResult {
