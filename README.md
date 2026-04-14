@@ -6,7 +6,6 @@
 
 ## Project Documents
 - [Proposal](https://drive.google.com/file/d/1fHH5PrYwscMxC24i6ncw-auUZfnq9JzB/view?usp=sharing)
-- [Milestone Project](https://drive.google.com/file/d/1VijTbikrY2i88_Sm0u1dNoGkF70GW7i0/view?usp=sharing)
 
 ## What This Repo Is For
 This repository is a research prototype for long-context decode on GPUs.
@@ -21,7 +20,16 @@ The repo currently contains four main decode paths:
 - `dense_cpu`: dense attention on CPU
 - `sparse_cpu`: CPU reference sparse pipeline with `score -> topk -> gather -> attend`
 - `dense_gpu`: dense CUDA baseline
-- `sparse_gpu`: naive sparse CUDA path on H100/sm90, with CPU page scoring/top-k and GPU gather + sparse attention
+- `sparse_gpu`: sparse CUDA path on H100/sm90, with GPU page scoring, GPU top-k selection, GPU gather, and GPU sparse attention; sparse layout preparation still includes host-side metadata work
+
+## Memory / Cache Infrastructure
+The sparse decode pipeline is built on top of explicit page-pool abstractions for both host and device memory.
+
+- `PagePool`: contiguous host-side K/V storage with page allocation, free-list reuse, and slot-based addressing
+- `PagedKvCache`: logical request-to-page mapping on top of `PagePool`, including page descriptors, page summaries, and request page order tracking
+- `DevicePagePool`: CUDA-resident mirror for page payloads and metadata used by the sparse GPU path
+
+These modules make it possible to separate logical page selection from the physical storage layout used by CPU and GPU decode paths.
 
 ## Build
 Basic build:
@@ -103,8 +111,11 @@ It also prints an `Accuracy` block with max-absolute-difference comparisons:
 ```text
 include/dsd/
   config.h                 model/runtime configuration
+  cuda_utils.h             CUDA helpers and checked device buffers
   types.h                  common pipeline data structures
+  page_pool.h              host-side page allocator for contiguous KV storage
   paged_kv_cache.h         paged KV-cache abstraction
+  device_page_pool.h       CUDA-resident page pool and page metadata storage
   reference_kernels.h      CPU reference scoring/top-k/gather/attention
   cuda_dense_attention.h   dense CUDA interface
   cuda_sparse_attention.h  sparse CUDA interface
@@ -114,23 +125,29 @@ include/dsd/
 
 src/
   main.cpp
+  page_pool.cpp
   paged_kv_cache.cpp
   reference_kernels.cpp
   decode_pipeline.cpp
   synthetic_data.cpp
+  device_page_pool.cpp     CUDA-backed page-pool implementation
+  cuda_dense_attention_stub.cpp
+  cuda_sparse_attention_stub.cpp
   cuda/kernels.cu          dense CUDA baseline
-  cuda/sparse_attention.cu sparse CUDA gather + attention
+  cuda/sparse_attention.cu sparse CUDA score/top-k/gather/attention
 
 benchmarks/
   bench_decode.cpp         benchmark harness for dense/sparse CPU/GPU comparison
 
 tests/
+  test_page_pool.cpp
   test_reference.cpp
+  test_device_page_pool.cpp
   test_dense_cuda.cpp
   test_sparse_cuda.cpp
 ```
 
 ## Notes
 - The current `sparse_gpu` path is correctness-first and not yet batch-optimized.
-- In the current implementation, sparse page scoring and top-k selection are still on CPU.
+- In the current implementation, `sparse_gpu` runs score/top-k/gather/attention on GPU, while sparse layout preparation still includes host-side metadata work.
 - `sparse_gpu` total time includes kernel time plus host/device copy, allocation, and synchronization overhead.
