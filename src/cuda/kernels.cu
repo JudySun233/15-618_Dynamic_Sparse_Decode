@@ -212,24 +212,46 @@ DenseBatchResult DenseAttentionCudaBatch(
       static_cast<std::size_t>(packed.num_requests) * packed.elements_per_token;
   const float scale = 1.0f / std::sqrt(static_cast<float>(packed.head_dim));
 
-  DeviceArray<float> d_queries(packed.queries.size());
-  DeviceArray<int> d_request_page_offsets(packed.request_page_offsets.size());
-  DeviceArray<int> d_request_page_ids(packed.request_page_ids.size());
-  DeviceArray<std::uint64_t> d_page_k_offsets(packed.page_k_offsets.size());
-  DeviceArray<std::uint64_t> d_page_v_offsets(packed.page_v_offsets.size());
-  DeviceArray<int> d_page_token_counts(packed.page_token_counts.size());
-  DeviceArray<float> d_key_pool(cache.KeyPool().size());
-  DeviceArray<float> d_value_pool(cache.ValuePool().size());
-  DeviceArray<float> d_outputs(output_elements);
+  RuntimeOverheadTimings* overheads = &result.runtime_overheads;
 
-  d_queries.CopyFromHost(packed.queries);
-  d_request_page_offsets.CopyFromHost(packed.request_page_offsets);
-  d_request_page_ids.CopyFromHost(packed.request_page_ids);
-  d_page_k_offsets.CopyFromHost(packed.page_k_offsets);
-  d_page_v_offsets.CopyFromHost(packed.page_v_offsets);
-  d_page_token_counts.CopyFromHost(packed.page_token_counts);
-  d_key_pool.CopyFromHost(cache.KeyPool());
-  d_value_pool.CopyFromHost(cache.ValuePool());
+  DeviceArray<float> d_queries;
+  DeviceArray<int> d_request_page_offsets;
+  DeviceArray<int> d_request_page_ids;
+  DeviceArray<std::uint64_t> d_page_k_offsets;
+  DeviceArray<std::uint64_t> d_page_v_offsets;
+  DeviceArray<int> d_page_token_counts;
+  DeviceArray<float> d_key_pool;
+  DeviceArray<float> d_value_pool;
+  DeviceArray<float> d_outputs;
+
+  d_queries.Allocate(packed.queries.size(), &overheads->time_malloc_ms);
+  d_request_page_offsets.Allocate(
+      packed.request_page_offsets.size(), &overheads->time_malloc_ms);
+  d_request_page_ids.Allocate(
+      packed.request_page_ids.size(), &overheads->time_malloc_ms);
+  d_page_k_offsets.Allocate(
+      packed.page_k_offsets.size(), &overheads->time_malloc_ms);
+  d_page_v_offsets.Allocate(
+      packed.page_v_offsets.size(), &overheads->time_malloc_ms);
+  d_page_token_counts.Allocate(
+      packed.page_token_counts.size(), &overheads->time_malloc_ms);
+  d_key_pool.Allocate(cache.KeyPool().size(), &overheads->time_malloc_ms);
+  d_value_pool.Allocate(cache.ValuePool().size(), &overheads->time_malloc_ms);
+  d_outputs.Allocate(output_elements, &overheads->time_malloc_ms);
+
+  d_queries.CopyFromHost(packed.queries, &overheads->time_memcpy_h2d_ms);
+  d_request_page_offsets.CopyFromHost(
+      packed.request_page_offsets, &overheads->time_memcpy_h2d_ms);
+  d_request_page_ids.CopyFromHost(
+      packed.request_page_ids, &overheads->time_memcpy_h2d_ms);
+  d_page_k_offsets.CopyFromHost(
+      packed.page_k_offsets, &overheads->time_memcpy_h2d_ms);
+  d_page_v_offsets.CopyFromHost(
+      packed.page_v_offsets, &overheads->time_memcpy_h2d_ms);
+  d_page_token_counts.CopyFromHost(
+      packed.page_token_counts, &overheads->time_memcpy_h2d_ms);
+  d_key_pool.CopyFromHost(cache.KeyPool(), &overheads->time_memcpy_h2d_ms);
+  d_value_pool.CopyFromHost(cache.ValuePool(), &overheads->time_memcpy_h2d_ms);
 
   cudaEvent_t start_event = nullptr;
   cudaEvent_t stop_event = nullptr;
@@ -243,7 +265,8 @@ DenseBatchResult DenseAttentionCudaBatch(
     float kernel_ms = 0.0f;
 
     DSD_CUDA_CHECK(cudaEventRecord(start_event));
-    DenseDecodeAttentionKernel<<<blocks, kThreadsPerBlock>>>(
+    TimeHostMs(&overheads->time_kernel_launch_ms, [&]() {
+      DenseDecodeAttentionKernel<<<blocks, kThreadsPerBlock>>>(
         d_queries.get(),
         d_request_page_offsets.get(),
         d_request_page_ids.get(),
@@ -258,9 +281,12 @@ DenseBatchResult DenseAttentionCudaBatch(
         packed.elements_per_token,
         scale,
         d_outputs.get());
-    DSD_CUDA_CHECK(cudaGetLastError());
+      DSD_CUDA_CHECK(cudaGetLastError());
+    });
     DSD_CUDA_CHECK(cudaEventRecord(stop_event));
-    DSD_CUDA_CHECK(cudaEventSynchronize(stop_event));
+    TimeHostMs(&overheads->time_sync_ms, [&]() {
+      DSD_CUDA_CHECK(cudaEventSynchronize(stop_event));
+    });
     DSD_CUDA_CHECK(cudaEventElapsedTime(&kernel_ms, start_event, stop_event));
     result.kernel_ms = kernel_ms;
   } catch (...) {
@@ -270,7 +296,16 @@ DenseBatchResult DenseAttentionCudaBatch(
   }
 
   std::vector<float> host_outputs;
-  d_outputs.CopyToHost(&host_outputs);
+  d_outputs.CopyToHost(&host_outputs, &overheads->time_memcpy_d2h_ms);
+  d_outputs.Reset(&overheads->time_free_ms);
+  d_value_pool.Reset(&overheads->time_free_ms);
+  d_key_pool.Reset(&overheads->time_free_ms);
+  d_page_token_counts.Reset(&overheads->time_free_ms);
+  d_page_v_offsets.Reset(&overheads->time_free_ms);
+  d_page_k_offsets.Reset(&overheads->time_free_ms);
+  d_request_page_ids.Reset(&overheads->time_free_ms);
+  d_request_page_offsets.Reset(&overheads->time_free_ms);
+  d_queries.Reset(&overheads->time_free_ms);
   cudaEventDestroy(start_event);
   cudaEventDestroy(stop_event);
 

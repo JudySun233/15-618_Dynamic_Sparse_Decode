@@ -2,8 +2,6 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
-#include <limits>
-#include <numeric>
 #include <string>
 #include <vector>
 
@@ -31,6 +29,7 @@ struct SparseCpuStats {
   double topk_ms = 0.0;
   double gather_ms = 0.0;
   double attention_ms = 0.0;
+  dsd::RuntimeOverheadTimings runtime_overheads;
   std::vector<dsd::SparseDecodeResult> outputs;
 };
 
@@ -42,12 +41,14 @@ struct SparseGpuStats {
   double gather_ms = 0.0;
   double attention_ms = 0.0;
   double gpu_kernel_ms = 0.0;
+  dsd::RuntimeOverheadTimings runtime_overheads;
   std::vector<dsd::SparseDecodeResult> outputs;
 };
 
 struct DenseCpuStats {
   double total_ms = 0.0;
   double attention_ms = 0.0;
+  dsd::RuntimeOverheadTimings runtime_overheads;
   std::vector<dsd::AttentionResult> outputs;
 };
 
@@ -56,8 +57,39 @@ struct DenseGpuStats {
   double total_ms = 0.0;
   double attention_ms = 0.0;
   double gpu_kernel_ms = 0.0;
+  dsd::RuntimeOverheadTimings runtime_overheads;
   std::vector<dsd::AttentionResult> outputs;
 };
+
+void AccumulateRuntimeOverheads(
+    dsd::RuntimeOverheadTimings* dst,
+    const dsd::RuntimeOverheadTimings& src) {
+  dst->time_malloc_ms += src.time_malloc_ms;
+  dst->time_memcpy_h2d_ms += src.time_memcpy_h2d_ms;
+  dst->time_memcpy_d2h_ms += src.time_memcpy_d2h_ms;
+  dst->time_free_ms += src.time_free_ms;
+  dst->time_kernel_launch_ms += src.time_kernel_launch_ms;
+  dst->time_sync_ms += src.time_sync_ms;
+  dst->time_prepare_sparse_layout_ms += src.time_prepare_sparse_layout_ms;
+}
+
+void AverageRuntimeOverheads(dsd::RuntimeOverheadTimings* timings, int iterations) {
+  const double scale = 1.0 / static_cast<double>(iterations);
+  timings->time_malloc_ms *= scale;
+  timings->time_memcpy_h2d_ms *= scale;
+  timings->time_memcpy_d2h_ms *= scale;
+  timings->time_free_ms *= scale;
+  timings->time_kernel_launch_ms *= scale;
+  timings->time_sync_ms *= scale;
+  timings->time_prepare_sparse_layout_ms *= scale;
+}
+
+double TotalRuntimeOverheadMs(const dsd::RuntimeOverheadTimings& timings) {
+  return timings.time_malloc_ms + timings.time_memcpy_h2d_ms +
+         timings.time_memcpy_d2h_ms + timings.time_free_ms +
+         timings.time_kernel_launch_ms + timings.time_sync_ms +
+         timings.time_prepare_sparse_layout_ms;
+}
 
 SparseCpuStats RunSparseCpu(
     dsd::DecodePipeline* pipeline,
@@ -112,6 +144,7 @@ SparseGpuStats RunSparseGpu(
     stats.gather_ms += result.timings.gather_ms;
     stats.attention_ms += result.timings.attention_ms;
     stats.gpu_kernel_ms += result.timings.gather_ms + result.timings.attention_ms;
+    AccumulateRuntimeOverheads(&stats.runtime_overheads, result.runtime_overheads);
     stats.outputs.push_back(std::move(result));
   }
   const auto total_end = Clock::now();
@@ -135,6 +168,7 @@ DenseGpuStats RunDenseGpu(
   stats.total_ms = std::chrono::duration<double, std::milli>(total_end - total_start).count();
   stats.attention_ms = batch.kernel_ms;
   stats.gpu_kernel_ms = batch.kernel_ms;
+  stats.runtime_overheads = batch.runtime_overheads;
   stats.outputs = batch.outputs;
   return stats;
 }
@@ -208,6 +242,24 @@ void PrintBreakdownRow(
             << "  " << note << "\n";
 }
 
+void PrintRuntimeOverheadRow(
+    const std::string& path,
+    bool available,
+    const dsd::RuntimeOverheadTimings& timings,
+    const std::string& note) {
+  std::cout << std::left << std::setw(12) << path
+            << std::right << std::setw(12) << std::fixed << std::setprecision(3)
+            << (available ? timings.time_malloc_ms : 0.0)
+            << std::setw(12) << (available ? timings.time_memcpy_h2d_ms : 0.0)
+            << std::setw(12) << (available ? timings.time_memcpy_d2h_ms : 0.0)
+            << std::setw(12) << (available ? timings.time_free_ms : 0.0)
+            << std::setw(14) << (available ? timings.time_kernel_launch_ms : 0.0)
+            << std::setw(12) << (available ? timings.time_sync_ms : 0.0)
+            << std::setw(14) << (available ? timings.time_prepare_sparse_layout_ms : 0.0)
+            << std::setw(12) << (available ? TotalRuntimeOverheadMs(timings) : 0.0)
+            << "  " << note << "\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -246,15 +298,19 @@ int main(int argc, char** argv) {
 
   double dense_cpu_total_ms = 0.0;
   double dense_cpu_attention_ms = 0.0;
+  dsd::RuntimeOverheadTimings dense_cpu_runtime_overheads;
+
   double sparse_cpu_total_ms = 0.0;
   double sparse_cpu_score_ms = 0.0;
   double sparse_cpu_topk_ms = 0.0;
   double sparse_cpu_gather_ms = 0.0;
   double sparse_cpu_attention_ms = 0.0;
+  dsd::RuntimeOverheadTimings sparse_cpu_runtime_overheads;
 
   double dense_gpu_total_ms = 0.0;
   double dense_gpu_attention_ms = 0.0;
   double dense_gpu_kernel_ms = 0.0;
+  dsd::RuntimeOverheadTimings dense_gpu_runtime_overheads;
 
   double sparse_gpu_total_ms = 0.0;
   double sparse_gpu_score_ms = 0.0;
@@ -262,6 +318,7 @@ int main(int argc, char** argv) {
   double sparse_gpu_gather_ms = 0.0;
   double sparse_gpu_attention_ms = 0.0;
   double sparse_gpu_kernel_ms = 0.0;
+  dsd::RuntimeOverheadTimings sparse_gpu_runtime_overheads;
 
   for (int i = 0; i < iterations; ++i) {
     dense_cpu_last = RunDenseCpu(&pipeline, batch.cache, batch.requests);
@@ -269,17 +326,21 @@ int main(int argc, char** argv) {
 
     dense_cpu_total_ms += dense_cpu_last.total_ms;
     dense_cpu_attention_ms += dense_cpu_last.attention_ms;
+    AccumulateRuntimeOverheads(&dense_cpu_runtime_overheads, dense_cpu_last.runtime_overheads);
+
     sparse_cpu_total_ms += sparse_cpu_last.total_ms;
     sparse_cpu_score_ms += sparse_cpu_last.score_ms;
     sparse_cpu_topk_ms += sparse_cpu_last.topk_ms;
     sparse_cpu_gather_ms += sparse_cpu_last.gather_ms;
     sparse_cpu_attention_ms += sparse_cpu_last.attention_ms;
+    AccumulateRuntimeOverheads(&sparse_cpu_runtime_overheads, sparse_cpu_last.runtime_overheads);
 
     if (dsd::DenseAttentionCudaAvailable()) {
       dense_gpu_last = RunDenseGpu(&pipeline, batch.cache, batch.requests);
       dense_gpu_total_ms += dense_gpu_last.total_ms;
       dense_gpu_attention_ms += dense_gpu_last.attention_ms;
       dense_gpu_kernel_ms += dense_gpu_last.gpu_kernel_ms;
+      AccumulateRuntimeOverheads(&dense_gpu_runtime_overheads, dense_gpu_last.runtime_overheads);
     }
 
     if (dsd::SparseAttentionCudaAvailable()) {
@@ -290,20 +351,26 @@ int main(int argc, char** argv) {
       sparse_gpu_gather_ms += sparse_gpu_last.gather_ms;
       sparse_gpu_attention_ms += sparse_gpu_last.attention_ms;
       sparse_gpu_kernel_ms += sparse_gpu_last.gpu_kernel_ms;
+      AccumulateRuntimeOverheads(&sparse_gpu_runtime_overheads, sparse_gpu_last.runtime_overheads);
     }
   }
 
   AverageOverIterations(&dense_cpu_total_ms, iterations);
   AverageOverIterations(&dense_cpu_attention_ms, iterations);
+  AverageRuntimeOverheads(&dense_cpu_runtime_overheads, iterations);
+
   AverageOverIterations(&sparse_cpu_total_ms, iterations);
   AverageOverIterations(&sparse_cpu_score_ms, iterations);
   AverageOverIterations(&sparse_cpu_topk_ms, iterations);
   AverageOverIterations(&sparse_cpu_gather_ms, iterations);
   AverageOverIterations(&sparse_cpu_attention_ms, iterations);
+  AverageRuntimeOverheads(&sparse_cpu_runtime_overheads, iterations);
+
   if (dsd::DenseAttentionCudaAvailable()) {
     AverageOverIterations(&dense_gpu_total_ms, iterations);
     AverageOverIterations(&dense_gpu_attention_ms, iterations);
     AverageOverIterations(&dense_gpu_kernel_ms, iterations);
+    AverageRuntimeOverheads(&dense_gpu_runtime_overheads, iterations);
   }
   if (dsd::SparseAttentionCudaAvailable()) {
     AverageOverIterations(&sparse_gpu_total_ms, iterations);
@@ -312,6 +379,7 @@ int main(int argc, char** argv) {
     AverageOverIterations(&sparse_gpu_gather_ms, iterations);
     AverageOverIterations(&sparse_gpu_attention_ms, iterations);
     AverageOverIterations(&sparse_gpu_kernel_ms, iterations);
+    AverageRuntimeOverheads(&sparse_gpu_runtime_overheads, iterations);
   }
 
   const float sparse_cpu_vs_dense_cpu =
@@ -393,7 +461,32 @@ int main(int argc, char** argv) {
       sparse_gpu_gather_ms,
       sparse_gpu_attention_ms,
       sparse_gpu_kernel_ms,
-      dsd::SparseAttentionCudaAvailable() ? "CPU select + GPU gather/attend" : "unavailable");
+      dsd::SparseAttentionCudaAvailable() ? "GPU score/top-k + gather/attend" : "unavailable");
+
+  std::cout << "\n== Runtime Overheads ==\n";
+  std::cout << std::left << std::setw(12) << "Path"
+            << std::right << std::setw(12) << "Malloc"
+            << std::setw(12) << "H2D"
+            << std::setw(12) << "D2H"
+            << std::setw(12) << "Free"
+            << std::setw(14) << "Launch"
+            << std::setw(12) << "Sync"
+            << std::setw(14) << "SparseLayout"
+            << std::setw(12) << "TotalOH"
+            << "  Note\n";
+  std::cout << std::string(122, '-') << "\n";
+  PrintRuntimeOverheadRow("dense_cpu", true, dense_cpu_runtime_overheads, "CPU path");
+  PrintRuntimeOverheadRow("sparse_cpu", true, sparse_cpu_runtime_overheads, "CPU path");
+  PrintRuntimeOverheadRow(
+      "dense_gpu",
+      dsd::DenseAttentionCudaAvailable(),
+      dense_gpu_runtime_overheads,
+      dsd::DenseAttentionCudaAvailable() ? "dense CUDA runtime" : "unavailable");
+  PrintRuntimeOverheadRow(
+      "sparse_gpu",
+      dsd::SparseAttentionCudaAvailable(),
+      sparse_gpu_runtime_overheads,
+      dsd::SparseAttentionCudaAvailable() ? "sparse CUDA runtime" : "unavailable");
 
   std::cout << "\n== Accuracy ==\n";
   std::cout << std::scientific << std::setprecision(6);
@@ -413,8 +506,9 @@ int main(int argc, char** argv) {
   std::cout << std::fixed << std::setprecision(3);
   std::cout << "End-to-End Total(ms) is the full wall time for that path.\n";
   std::cout << "Speedup is dense_cpu_total_ms / path_total_ms.\n";
-  std::cout << "Stage / Kernel Breakdown lists only the metrics that are actually measured for each path.\n";
-  std::cout << "For sparse_gpu, Score/TopK are still on CPU, while Gather/Attend/GPUKernel are measured on GPU.\n";
+  std::cout << "Stage / Kernel Breakdown shows compute-stage timings only.\n";
+  std::cout << "Runtime Overheads breaks out malloc/memcpy/free, kernel launch, sync, and sparse metadata preparation.\n";
+  std::cout << "For sparse_gpu, Score/TopK/Gather/Attend all run through the sparse CUDA path; sparse layout prep still includes host-side metadata work.\n";
   std::cout << "For dense_gpu, Attend and GPUKernel are both the measured CUDA dense-attention kernel time.\n";
 
   return 0;
