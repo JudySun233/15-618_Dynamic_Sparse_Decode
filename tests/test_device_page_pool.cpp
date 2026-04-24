@@ -69,9 +69,9 @@ void UploadRequestPagesInLogicalOrder(
   if (device_pool == nullptr) {
     throw std::invalid_argument("device_pool must be non-null");
   }
-  for (const auto page_id : cache.GetRequestPages(request_id)) {
-    device_pool->UploadPageFromCache(cache, page_id);
-  }
+  const auto& page_ids = cache.GetRequestPages(request_id);
+  device_pool->UploadPagesFromCache(cache, std::vector<dsd::PageId>(
+      page_ids.begin(), page_ids.end()));
 }
 
 bool CheckLogicalOrderUploadAndDownload() {
@@ -302,6 +302,128 @@ bool CheckIncrementalTokenUploadAndFree() {
   return true;
 }
 
+bool CheckBatchedTokenUploadAndReuse() {
+  dsd::ModelConfig config;
+  config.num_heads = 2;
+  config.head_dim = 4;
+  config.page_size = 3;
+  config.top_k_pages = 8;
+  dsd::PagedKvCache cache(config, 4);
+  dsd::DevicePagePool device_pool(config, cache.CapacityPages());
+
+  const int elements_per_token = config.num_heads * config.head_dim;
+  const auto token0_key = MakeSequence(elements_per_token, 11.0f);
+  const auto token0_value = MakeSequence(elements_per_token, 111.0f);
+  const auto append0 = cache.AppendToken(31, token0_key, token0_value);
+  const auto token1_key = MakeSequence(elements_per_token, 22.0f);
+  const auto token1_value = MakeSequence(elements_per_token, 222.0f);
+  const auto append1 = cache.AppendToken(31, token1_key, token1_value);
+  device_pool.UploadTokensFromCache(cache, {append0, append1});
+
+  std::vector<float> downloaded_keys;
+  std::vector<float> downloaded_values;
+  device_pool.DownloadPage(append0.page_id, &downloaded_keys, &downloaded_values);
+  std::vector<float> expected_keys = token0_key;
+  expected_keys.insert(expected_keys.end(), token1_key.begin(), token1_key.end());
+  std::vector<float> expected_values = token0_value;
+  expected_values.insert(expected_values.end(), token1_value.begin(), token1_value.end());
+  if (downloaded_keys != expected_keys || downloaded_values != expected_values) {
+    std::cerr << "batched token upload did not preserve same-page tokens\n";
+    return false;
+  }
+
+  const auto released = cache.ReleaseRequest(31);
+  device_pool.MarkPagesFree(released);
+  const auto reused_key = MakeSequence(elements_per_token, 33.0f);
+  const auto reused_value = MakeSequence(elements_per_token, 333.0f);
+  const auto reused = cache.AppendToken(32, reused_key, reused_value);
+  device_pool.UploadTokensFromCache(cache, {reused});
+  device_pool.DownloadPage(reused.page_id, &downloaded_keys, &downloaded_values);
+  if (downloaded_keys != reused_key || downloaded_values != reused_value) {
+    std::cerr << "batched token upload failed after page reuse\n";
+    return false;
+  }
+
+  return true;
+}
+
+bool CheckDirectPromptUpload() {
+  dsd::ModelConfig config;
+  config.num_heads = 2;
+  config.head_dim = 4;
+  config.page_size = 4;
+  config.top_k_pages = 8;
+  dsd::PagedKvCache cache(config, 8);
+  dsd::DevicePagePool device_pool(config, cache.CapacityPages());
+
+  const int elements_per_token = config.num_heads * config.head_dim;
+  const std::vector<int> token_counts = {4, 4, 2};
+  const auto page_ids = cache.ReservePagesForRequest(41, token_counts);
+  const int total_tokens = 10;
+  const auto prompt_keys = MakeSequence(total_tokens * elements_per_token, 7.0f);
+  const auto prompt_values = MakeSequence(total_tokens * elements_per_token, 70.0f);
+
+  device_pool.UploadPromptDirect(
+      cache, page_ids, token_counts, prompt_keys.data(), prompt_values.data());
+
+  int token_begin = 0;
+  for (std::size_t page_idx = 0; page_idx < page_ids.size(); ++page_idx) {
+    std::vector<float> downloaded_keys;
+    std::vector<float> downloaded_values;
+    device_pool.DownloadPage(
+        page_ids[page_idx], &downloaded_keys, &downloaded_values);
+    const int element_begin = token_begin * elements_per_token;
+    const int element_count = token_counts[page_idx] * elements_per_token;
+    const std::vector<float> expected_keys(
+        prompt_keys.begin() + element_begin,
+        prompt_keys.begin() + element_begin + element_count);
+    const std::vector<float> expected_values(
+        prompt_values.begin() + element_begin,
+        prompt_values.begin() + element_begin + element_count);
+    if (downloaded_keys != expected_keys || downloaded_values != expected_values) {
+      std::cerr << "direct prompt upload did not preserve prompt payload\n";
+      return false;
+    }
+    token_begin += token_counts[page_idx];
+  }
+
+  return true;
+}
+
+bool CheckSyntheticPromptPrefill() {
+  dsd::ModelConfig config;
+  config.num_heads = 2;
+  config.head_dim = 4;
+  config.page_size = 4;
+  config.top_k_pages = 8;
+  dsd::PagedKvCache cache(config, 8);
+  dsd::DevicePagePool device_pool(config, cache.CapacityPages());
+
+  const std::vector<int> token_counts = {4, 1};
+  const auto page_ids = cache.ReservePagesForRequest(42, token_counts);
+  device_pool.PrefillPromptSynthetic(cache, page_ids, token_counts, 42);
+
+  std::vector<int> downloaded_counts;
+  std::vector<std::uint8_t> live_mask;
+  device_pool.DownloadMetadata(&downloaded_counts, &live_mask);
+  for (std::size_t i = 0; i < page_ids.size(); ++i) {
+    const auto page_id = static_cast<std::size_t>(page_ids[i]);
+    if (downloaded_counts[page_id] != token_counts[i] || live_mask[page_id] != 1) {
+      std::cerr << "synthetic prefill did not update page metadata\n";
+      return false;
+    }
+  }
+
+  std::vector<float> downloaded_keys;
+  std::vector<float> downloaded_values;
+  device_pool.DownloadPage(page_ids.front(), &downloaded_keys, &downloaded_values);
+  if (downloaded_keys.empty() || downloaded_values.empty()) {
+    std::cerr << "synthetic prefill did not populate page payload\n";
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 int main() {
@@ -323,6 +445,15 @@ int main() {
     return 1;
   }
   if (!CheckIncrementalTokenUploadAndFree()) {
+    return 1;
+  }
+  if (!CheckBatchedTokenUploadAndReuse()) {
+    return 1;
+  }
+  if (!CheckDirectPromptUpload()) {
+    return 1;
+  }
+  if (!CheckSyntheticPromptPrefill()) {
     return 1;
   }
 

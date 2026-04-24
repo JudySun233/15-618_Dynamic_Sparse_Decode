@@ -28,12 +28,48 @@ class DevicePagePool {
 
   void UploadPageFromCache(const PagedKvCache& cache, PageId page_id);
 
+  void UploadPagesFromCache(
+      const PagedKvCache& cache,
+      const std::vector<PageId>& page_ids);
+
+  void UploadActivePagesFromCache(const PagedKvCache& cache);
+
+  void UploadPromptDirect(
+      const PagedKvCache& cache,
+      const std::vector<PageId>& page_ids,
+      const std::vector<int>& token_counts,
+      const float* prompt_keys,
+      const float* prompt_values);
+
+  void PrefillPromptSynthetic(
+      const PagedKvCache& cache,
+      const std::vector<PageId>& page_ids,
+      const std::vector<int>& token_counts,
+      int request_id);
+
   void UploadTokenFromCache(
       const PagedKvCache& cache,
       PageId page_id,
       int token_offset);
 
+  void UploadTokensFromCache(
+      const PagedKvCache& cache,
+      const std::vector<AppendTokenResult>& results);
+
+  void UploadTokensDirect(
+      const PagedKvCache& cache,
+      const std::vector<AppendTokenResult>& results,
+      const std::vector<float>& token_keys,
+      const std::vector<float>& token_values);
+
+  void AppendTokensSynthetic(
+      const PagedKvCache& cache,
+      const std::vector<AppendTokenResult>& results,
+      const std::vector<int>& request_ids,
+      const std::vector<int>& decode_steps);
+
   void MarkPageFree(PageId page_id);
+  void MarkPagesFree(const std::vector<PageId>& page_ids);
 
   void DownloadPage(
       PageId page_id,
@@ -45,6 +81,9 @@ class DevicePagePool {
       std::vector<std::uint8_t>* live_mask) const;
 
   void UploadAllFromCache(const PagedKvCache& cache);
+
+  void ResetTransferStats() { transfer_stats_ = DeviceTransferStats{}; }
+  const DeviceTransferStats& transfer_stats() const { return transfer_stats_; }
 
   int capacity_pages() const { return capacity_pages_; }
   int elements_per_token() const;
@@ -63,6 +102,10 @@ class DevicePagePool {
  private:
   void ValidatePageId(PageId page_id) const;
   std::size_t PageElementOffset(PageId page_id) const;
+  void EnsureTokenStagingCapacity(std::size_t token_count);
+  void EnsurePageStagingCapacity(std::size_t page_count);
+  void CopyHostToDevice(void* device_dst, const void* host_src, std::size_t bytes);
+  void CopyDeviceToHost(void* host_dst, const void* device_src, std::size_t bytes) const;
 
   ModelConfig config_;
   int capacity_pages_ = 0;
@@ -80,6 +123,20 @@ class DevicePagePool {
   DeviceArray<std::uint8_t> page_live_mask_;
   DeviceArray<std::uint64_t> page_k_offsets_;
   DeviceArray<std::uint64_t> page_v_offsets_;
+
+  DeviceArray<float> token_key_staging_;
+  DeviceArray<float> token_value_staging_;
+  DeviceArray<float> token_summary_staging_;
+  DeviceArray<int> token_page_id_staging_;
+  DeviceArray<int> token_offset_staging_;
+  DeviceArray<int> token_count_staging_;
+  DeviceArray<int> token_request_id_staging_;
+  DeviceArray<int> token_decode_step_staging_;
+  DeviceArray<int> page_id_staging_;
+  DeviceArray<int> page_token_count_staging_;
+  std::size_t token_staging_capacity_ = 0;
+  std::size_t page_staging_capacity_ = 0;
+  mutable DeviceTransferStats transfer_stats_;
 };
 
 }  // namespace dsd

@@ -22,9 +22,15 @@ class DenseCudaContext {
   DenseBatchResult RunBatch(const std::vector<RequestState>& requests);
 
   void SyncPageFromCache(const PagedKvCache& cache, PageId page_id);
+  void SyncPagesFromCache(
+      const PagedKvCache& cache,
+      const std::vector<PageId>& page_ids);
   void SyncAppendedToken(
       const PagedKvCache& cache,
       const AppendTokenResult& result);
+  void SyncAppendedTokens(
+      const PagedKvCache& cache,
+      const std::vector<AppendTokenResult>& results);
   void SyncFreedPages(const std::vector<PageId>& page_ids);
 
  private:

@@ -15,16 +15,21 @@ int ValidateCapacityPages(int capacity_pages) {
 
 }  // namespace
 
-PagePool::PagePool(ModelConfig config, int capacity_pages)
+PagePool::PagePool(ModelConfig config, int capacity_pages, bool allocate_storage)
     : config_(config),
       capacity_pages_(ValidateCapacityPages(capacity_pages)),
       is_allocated_(static_cast<std::size_t>(capacity_pages_), 0),
       key_storage_(
-          static_cast<std::size_t>(capacity_pages_) * elements_per_page(),
+          allocate_storage
+              ? static_cast<std::size_t>(capacity_pages_) * elements_per_page()
+              : 0,
           0.0f),
       value_storage_(
-          static_cast<std::size_t>(capacity_pages_) * elements_per_page(),
-          0.0f) {
+          allocate_storage
+              ? static_cast<std::size_t>(capacity_pages_) * elements_per_page()
+              : 0,
+          0.0f),
+      has_storage_(allocate_storage) {
   InitializeFreeList();
 }
 
@@ -49,6 +54,7 @@ void PagePool::free_page(PageId page_id) {
 float* PagePool::get_k_page_ptr(PageId page_id) {
   ValidatePageId(page_id);
   ValidateAllocated(page_id);
+  ValidateStorage();
   return key_storage_.data() +
          static_cast<std::ptrdiff_t>(page_id) * elements_per_page();
 }
@@ -56,6 +62,7 @@ float* PagePool::get_k_page_ptr(PageId page_id) {
 const float* PagePool::get_k_page_ptr(PageId page_id) const {
   ValidatePageId(page_id);
   ValidateAllocated(page_id);
+  ValidateStorage();
   return key_storage_.data() +
          static_cast<std::ptrdiff_t>(page_id) * elements_per_page();
 }
@@ -63,6 +70,7 @@ const float* PagePool::get_k_page_ptr(PageId page_id) const {
 float* PagePool::get_v_page_ptr(PageId page_id) {
   ValidatePageId(page_id);
   ValidateAllocated(page_id);
+  ValidateStorage();
   return value_storage_.data() +
          static_cast<std::ptrdiff_t>(page_id) * elements_per_page();
 }
@@ -70,6 +78,7 @@ float* PagePool::get_v_page_ptr(PageId page_id) {
 const float* PagePool::get_v_page_ptr(PageId page_id) const {
   ValidatePageId(page_id);
   ValidateAllocated(page_id);
+  ValidateStorage();
   return value_storage_.data() +
          static_cast<std::ptrdiff_t>(page_id) * elements_per_page();
 }
@@ -101,6 +110,12 @@ void PagePool::ValidatePageId(PageId page_id) const {
 void PagePool::ValidateAllocated(PageId page_id) const {
   if (!is_allocated_[static_cast<std::size_t>(page_id)]) {
     throw std::runtime_error("page is not currently allocated");
+  }
+}
+
+void PagePool::ValidateStorage() const {
+  if (!has_storage_) {
+    throw std::runtime_error("page pool KV storage is disabled");
   }
 }
 

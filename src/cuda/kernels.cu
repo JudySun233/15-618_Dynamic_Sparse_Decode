@@ -191,7 +191,7 @@ DenseCudaContext::DenseCudaContext(
   if (config.head_dim <= 0 || config.head_dim > kMaxHeadDim) {
     throw std::invalid_argument("head_dim must be in (0, 256] for CUDA baseline");
   }
-  device_page_pool_.UploadAllFromCache(cache);
+  device_page_pool_.UploadActivePagesFromCache(cache);
 }
 
 DenseBatchResult DenseCudaContext::RunBatch(
@@ -294,21 +294,31 @@ DenseBatchResult DenseCudaContext::RunBatch(
 void DenseCudaContext::SyncPageFromCache(
     const PagedKvCache& cache,
     PageId page_id) {
+  SyncPagesFromCache(cache, std::vector<PageId>{page_id});
+}
+
+void DenseCudaContext::SyncPagesFromCache(
+    const PagedKvCache& cache,
+    const std::vector<PageId>& page_ids) {
   cache_ = &cache;
-  device_page_pool_.UploadPageFromCache(cache, page_id);
+  device_page_pool_.UploadPagesFromCache(cache, page_ids);
 }
 
 void DenseCudaContext::SyncAppendedToken(
     const PagedKvCache& cache,
     const AppendTokenResult& result) {
+  SyncAppendedTokens(cache, std::vector<AppendTokenResult>{result});
+}
+
+void DenseCudaContext::SyncAppendedTokens(
+    const PagedKvCache& cache,
+    const std::vector<AppendTokenResult>& results) {
   cache_ = &cache;
-  device_page_pool_.UploadTokenFromCache(cache, result.page_id, result.token_offset);
+  device_page_pool_.UploadTokensFromCache(cache, results);
 }
 
 void DenseCudaContext::SyncFreedPages(const std::vector<PageId>& page_ids) {
-  for (PageId page_id : page_ids) {
-    device_page_pool_.MarkPageFree(page_id);
-  }
+  device_page_pool_.MarkPagesFree(page_ids);
 }
 
 DenseBatchResult DenseAttentionCudaBatch(

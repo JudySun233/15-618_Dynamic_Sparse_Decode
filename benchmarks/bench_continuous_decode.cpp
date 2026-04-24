@@ -2,6 +2,7 @@
 #include <iomanip>
 #include <iostream>
 #include <string>
+#include <stdexcept>
 
 #include "dsd/config.h"
 #include "dsd/continuous_batching.h"
@@ -16,9 +17,92 @@ int ReadArgOrDefault(int argc, char** argv, int index, int fallback) {
   return std::atoi(argv[index]);
 }
 
+dsd::ContinuousPromptAdmissionMode ParseAdmissionMode(int value) {
+  switch (value) {
+    case 0:
+      return dsd::ContinuousPromptAdmissionMode::kCpuCache;
+    case 1:
+      return dsd::ContinuousPromptAdmissionMode::kDirectGpuUpload;
+    case 2:
+      return dsd::ContinuousPromptAdmissionMode::kSyntheticGpuPrefill;
+    default:
+      throw std::invalid_argument(
+          "admission_mode must be 0=cpu_cache, 1=direct_gpu_upload, "
+          "or 2=synthetic_gpu_prefill");
+  }
+}
+
+const char* AdmissionModeName(dsd::ContinuousPromptAdmissionMode mode) {
+  switch (mode) {
+    case dsd::ContinuousPromptAdmissionMode::kCpuCache:
+      return "cpu_cache";
+    case dsd::ContinuousPromptAdmissionMode::kDirectGpuUpload:
+      return "direct_gpu_upload";
+    case dsd::ContinuousPromptAdmissionMode::kSyntheticGpuPrefill:
+      return "synthetic_gpu_prefill";
+  }
+  return "unknown";
+}
+
+dsd::SparseBatchOutputMode ParseOutputMode(int value) {
+  switch (value) {
+    case 0:
+      return dsd::SparseBatchOutputMode::kNoOutputs;
+    case 1:
+      return dsd::SparseBatchOutputMode::kOutputsOnly;
+    case 2:
+      return dsd::SparseBatchOutputMode::kDebugTensors;
+    default:
+      throw std::invalid_argument(
+          "run_batch_output_mode must be 0=no_outputs, 1=outputs_only, "
+          "or 2=debug_tensors");
+  }
+}
+
+const char* OutputModeName(dsd::SparseBatchOutputMode mode) {
+  switch (mode) {
+    case dsd::SparseBatchOutputMode::kNoOutputs:
+      return "no_outputs";
+    case dsd::SparseBatchOutputMode::kOutputsOnly:
+      return "outputs_only";
+    case dsd::SparseBatchOutputMode::kDebugTensors:
+      return "debug_tensors";
+  }
+  return "unknown";
+}
+
+dsd::SparseBatchTimingMode ParseTimingMode(int value) {
+  switch (value) {
+    case 0:
+      return dsd::SparseBatchTimingMode::kNone;
+    case 1:
+      return dsd::SparseBatchTimingMode::kKernelEvents;
+    default:
+      throw std::invalid_argument(
+          "run_batch_timing_mode must be 0=none or 1=kernel_events");
+  }
+}
+
+const char* TimingModeName(dsd::SparseBatchTimingMode mode) {
+  switch (mode) {
+    case dsd::SparseBatchTimingMode::kNone:
+      return "none";
+    case dsd::SparseBatchTimingMode::kKernelEvents:
+      return "kernel_events";
+  }
+  return "unknown";
+}
+
 void PrintStats(const std::string& label, const dsd::ContinuousBatchStats& stats) {
   std::cout << label << "_total_ms=" << stats.total_wall_ms << "\n";
   std::cout << label << "_tokens_per_second=" << stats.tokens_per_second << "\n";
+  std::cout << label << "_admission_ms=" << stats.admission_ms << "\n";
+  std::cout << label << "_append_sync_ms=" << stats.append_sync_ms << "\n";
+  std::cout << label << "_release_sync_ms=" << stats.release_sync_ms << "\n";
+  std::cout << label << "_decode_payload_prep_ms="
+            << stats.decode_payload_prep_ms << "\n";
+  std::cout << label << "_run_batch_wall_ms=" << stats.run_batch_wall_ms << "\n";
+  std::cout << label << "_outside_run_batch_ms=" << stats.outside_run_batch_ms << "\n";
   std::cout << label << "_avg_step_ms=" << stats.avg_step_ms << "\n";
   std::cout << label << "_p50_step_ms=" << stats.p50_step_ms << "\n";
   std::cout << label << "_p95_step_ms=" << stats.p95_step_ms << "\n";
@@ -34,6 +118,20 @@ void PrintStats(const std::string& label, const dsd::ContinuousBatchStats& stats
   std::cout << label << "_avg_sync_ms=" << stats.avg_runtime_overheads.time_sync_ms << "\n";
   std::cout << label << "_avg_prepare_sparse_layout_ms="
             << stats.avg_runtime_overheads.time_prepare_sparse_layout_ms << "\n";
+  std::cout << label << "_device_h2d_bytes=" << stats.device_transfer_stats.h2d_bytes << "\n";
+  std::cout << label << "_device_d2h_bytes=" << stats.device_transfer_stats.d2h_bytes << "\n";
+  std::cout << label << "_device_h2d_calls=" << stats.device_transfer_stats.h2d_calls << "\n";
+  std::cout << label << "_device_d2h_calls=" << stats.device_transfer_stats.d2h_calls << "\n";
+  std::cout << label << "_device_h2d_large_calls="
+            << stats.device_transfer_stats.h2d_large_calls << "\n";
+  std::cout << label << "_device_d2h_large_calls="
+            << stats.device_transfer_stats.d2h_large_calls << "\n";
+  std::cout << label << "_admission_device_h2d_bytes="
+            << stats.admission_device_transfer_stats.h2d_bytes << "\n";
+  std::cout << label << "_admission_device_h2d_calls="
+            << stats.admission_device_transfer_stats.h2d_calls << "\n";
+  std::cout << label << "_admission_device_h2d_large_calls="
+            << stats.admission_device_transfer_stats.h2d_large_calls << "\n";
 }
 
 }  // namespace
@@ -51,6 +149,18 @@ int main(int argc, char** argv) {
   const int head_dim = ReadArgOrDefault(argc, argv, 10, 128);
   const int page_size = ReadArgOrDefault(argc, argv, 11, 16);
   const int top_k_pages = ReadArgOrDefault(argc, argv, 12, 8);
+  const int admission_mode_arg = ReadArgOrDefault(argc, argv, 13, 0);
+  const bool preadmit_prompts = ReadArgOrDefault(argc, argv, 14, 0) != 0;
+  const bool precompute_decode_payloads =
+      ReadArgOrDefault(argc, argv, 15, 0) != 0;
+  const bool gpu_synthetic_decode_append =
+      ReadArgOrDefault(argc, argv, 16, 0) != 0;
+  const bool lazy_release = ReadArgOrDefault(argc, argv, 17, 0) != 0;
+  const auto run_batch_output_mode =
+      ParseOutputMode(ReadArgOrDefault(argc, argv, 18, 1));
+  const auto run_batch_timing_mode =
+      ParseTimingMode(ReadArgOrDefault(argc, argv, 19, 1));
+  const auto admission_mode = ParseAdmissionMode(admission_mode_arg);
 
   dsd::ModelConfig config;
   config.num_heads = num_heads;
@@ -71,6 +181,17 @@ int main(int argc, char** argv) {
   std::cout << "head_dim=" << head_dim << "\n";
   std::cout << "page_size=" << page_size << "\n";
   std::cout << "top_k_pages=" << top_k_pages << "\n";
+  std::cout << "admission_mode=" << AdmissionModeName(admission_mode) << "\n";
+  std::cout << "preadmit_prompts=" << (preadmit_prompts ? 1 : 0) << "\n";
+  std::cout << "precompute_decode_payloads="
+            << (precompute_decode_payloads ? 1 : 0) << "\n";
+  std::cout << "gpu_synthetic_decode_append="
+            << (gpu_synthetic_decode_append ? 1 : 0) << "\n";
+  std::cout << "lazy_release=" << (lazy_release ? 1 : 0) << "\n";
+  std::cout << "run_batch_output_mode="
+            << OutputModeName(run_batch_output_mode) << "\n";
+  std::cout << "run_batch_timing_mode="
+            << TimingModeName(run_batch_timing_mode) << "\n";
 
   if (!dsd::SparseAttentionCudaAvailable()) {
     std::cout << "continuous_sparse_available=0\n";
@@ -88,8 +209,16 @@ int main(int argc, char** argv) {
       min_decode_steps,
       max_decode_steps,
       seed);
-  const auto result =
-      dsd::RunContinuousSparseBenchmark(config, workload, max_active_requests);
+  dsd::ContinuousDecodeOptions options;
+  options.max_active_requests = max_active_requests;
+  options.prompt_admission_mode = admission_mode;
+  options.preadmit_prompts = preadmit_prompts;
+  options.precompute_decode_payloads = precompute_decode_payloads;
+  options.gpu_synthetic_decode_append = gpu_synthetic_decode_append;
+  options.lazy_release = lazy_release;
+  options.run_batch_output_mode = run_batch_output_mode;
+  options.run_batch_timing_mode = run_batch_timing_mode;
+  const auto result = dsd::RunContinuousSparseBenchmark(config, workload, options);
 
   std::cout << "total_generated_tokens="
             << result.continuous_sparse.total_generated_tokens << "\n";

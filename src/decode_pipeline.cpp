@@ -83,7 +83,7 @@ DenseBatchResult DecodePipeline::RunDenseBatchCuda(
 SparseBatchCudaResult DecodePipeline::RunNaiveSparseBatchCuda(
     SparseCudaContext& context,
     const std::vector<RequestState>& requests) const {
-  return context.RunBatch(requests);
+  return context.RunBatch(requests, SparseBatchOutputMode::kDebugTensors);
 }
 
 BatchDecodeResult DecodePipeline::RunNaiveSparseBatch(

@@ -137,6 +137,42 @@ bool CheckContinuousBenchmarkRunner() {
     return false;
   }
 
+  dsd::ContinuousDecodeOptions direct_options;
+  direct_options.max_active_requests = 2;
+  direct_options.prompt_admission_mode =
+      dsd::ContinuousPromptAdmissionMode::kDirectGpuUpload;
+  direct_options.preadmit_prompts = true;
+  direct_options.precompute_decode_payloads = true;
+  const auto direct_stats =
+      dsd::RunContinuousSparseDecode(config, workload, direct_options);
+  if (direct_stats.total_generated_tokens != expected_tokens ||
+      direct_stats.tokens_per_second <= 0.0 ||
+      direct_stats.admission_ms <= 0.0 ||
+      direct_stats.admission_device_transfer_stats.h2d_calls == 0) {
+    std::cerr << "direct preadmitted continuous runner produced invalid stats\n";
+    return false;
+  }
+
+  dsd::ContinuousDecodeOptions synthetic_options;
+  synthetic_options.max_active_requests = 2;
+  synthetic_options.prompt_admission_mode =
+      dsd::ContinuousPromptAdmissionMode::kSyntheticGpuPrefill;
+  synthetic_options.preadmit_prompts = true;
+  synthetic_options.precompute_decode_payloads = true;
+  synthetic_options.gpu_synthetic_decode_append = true;
+  synthetic_options.lazy_release = true;
+  synthetic_options.run_batch_output_mode = dsd::SparseBatchOutputMode::kNoOutputs;
+  synthetic_options.run_batch_timing_mode = dsd::SparseBatchTimingMode::kNone;
+  const auto synthetic_stats =
+      dsd::RunContinuousSparseDecode(config, workload, synthetic_options);
+  if (synthetic_stats.total_generated_tokens != expected_tokens ||
+      synthetic_stats.tokens_per_second <= 0.0 ||
+      synthetic_stats.admission_ms <= 0.0 ||
+      synthetic_stats.admission_device_transfer_stats.h2d_calls == 0) {
+    std::cerr << "synthetic preadmitted continuous runner produced invalid stats\n";
+    return false;
+  }
+
   return true;
 }
 

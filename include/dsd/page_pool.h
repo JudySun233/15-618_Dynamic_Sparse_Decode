@@ -10,7 +10,7 @@ namespace dsd {
 
 class PagePool {
  public:
-  PagePool(ModelConfig config, int capacity_pages);
+  PagePool(ModelConfig config, int capacity_pages, bool allocate_storage = true);
 
   PageId allocate_page();
   void free_page(PageId page_id);
@@ -30,10 +30,12 @@ class PagePool {
 
   const std::vector<float>& key_storage() const { return key_storage_; }
   const std::vector<float>& value_storage() const { return value_storage_; }
+  bool has_storage() const { return has_storage_; }
 
  private:
   void ValidatePageId(PageId page_id) const;
   void ValidateAllocated(PageId page_id) const;
+  void ValidateStorage() const;
   void InitializeFreeList();
 
   ModelConfig config_;
@@ -42,6 +44,7 @@ class PagePool {
   std::vector<std::uint8_t> is_allocated_;
   std::vector<float> key_storage_;
   std::vector<float> value_storage_;
+  bool has_storage_ = true;
 };
 
 }  // namespace dsd
