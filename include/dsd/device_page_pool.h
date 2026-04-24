@@ -28,6 +28,13 @@ class DevicePagePool {
 
   void UploadPageFromCache(const PagedKvCache& cache, PageId page_id);
 
+  void UploadTokenFromCache(
+      const PagedKvCache& cache,
+      PageId page_id,
+      int token_offset);
+
+  void MarkPageFree(PageId page_id);
+
   void DownloadPage(
       PageId page_id,
       std::vector<float>* host_keys,

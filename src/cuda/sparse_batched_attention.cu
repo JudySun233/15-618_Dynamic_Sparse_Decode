@@ -597,6 +597,26 @@ SparseBatchCudaResult SparseCudaContext::RunBatch(
   return result;
 }
 
+void SparseCudaContext::SyncPageFromCache(
+    const PagedKvCache& cache,
+    PageId page_id) {
+  cache_ = &cache;
+  device_page_pool_.UploadPageFromCache(cache, page_id);
+}
+
+void SparseCudaContext::SyncAppendedToken(
+    const PagedKvCache& cache,
+    const AppendTokenResult& result) {
+  cache_ = &cache;
+  device_page_pool_.UploadTokenFromCache(cache, result.page_id, result.token_offset);
+}
+
+void SparseCudaContext::SyncFreedPages(const std::vector<PageId>& page_ids) {
+  for (PageId page_id : page_ids) {
+    device_page_pool_.MarkPageFree(page_id);
+  }
+}
+
 SparseDecodeResult SparseDecodeCuda(
     const PagedKvCache& cache,
     const RequestState& request,

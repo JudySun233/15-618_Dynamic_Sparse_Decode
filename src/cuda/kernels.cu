@@ -291,6 +291,26 @@ DenseBatchResult DenseCudaContext::RunBatch(
   return result;
 }
 
+void DenseCudaContext::SyncPageFromCache(
+    const PagedKvCache& cache,
+    PageId page_id) {
+  cache_ = &cache;
+  device_page_pool_.UploadPageFromCache(cache, page_id);
+}
+
+void DenseCudaContext::SyncAppendedToken(
+    const PagedKvCache& cache,
+    const AppendTokenResult& result) {
+  cache_ = &cache;
+  device_page_pool_.UploadTokenFromCache(cache, result.page_id, result.token_offset);
+}
+
+void DenseCudaContext::SyncFreedPages(const std::vector<PageId>& page_ids) {
+  for (PageId page_id : page_ids) {
+    device_page_pool_.MarkPageFree(page_id);
+  }
+}
+
 DenseBatchResult DenseAttentionCudaBatch(
     const PagedKvCache& cache,
     const std::vector<RequestState>& requests,

@@ -152,6 +152,9 @@ void DevicePagePool::UploadAllFromCache(const PagedKvCache& cache) {
 }
 
 void DevicePagePool::UploadPageFromCache(const PagedKvCache& cache, PageId page_id) {
+  if (cache.CapacityPages() != capacity_pages_) {
+    throw std::invalid_argument("cache capacity does not match device page pool");
+  }
   const auto& page = cache.GetPage(page_id);
   if (page.request_id == -1 || page.token_count == 0) {
     throw std::invalid_argument("cannot upload a free or empty page from cache");
@@ -160,6 +163,112 @@ void DevicePagePool::UploadPageFromCache(const PagedKvCache& cache, PageId page_
   const auto keys = cache.CopyPageKeys(page_id);
   const auto values = cache.CopyPageValues(page_id);
   UploadPage(page_id, keys.data(), values.data(), page.token_count);
+  const auto summary = cache.CopyPageSummary(page_id);
+  const std::size_t summary_offset =
+      static_cast<std::size_t>(page_id) * elements_per_token();
+  std::copy(
+      summary.begin(),
+      summary.end(),
+      host_page_summaries_.begin() + static_cast<std::ptrdiff_t>(summary_offset));
+  DSD_CUDA_CHECK(cudaMemcpy(
+      page_summaries_.get() + static_cast<std::ptrdiff_t>(summary_offset),
+      summary.data(),
+      static_cast<std::size_t>(elements_per_token()) * sizeof(float),
+      cudaMemcpyHostToDevice));
+}
+
+void DevicePagePool::UploadTokenFromCache(
+    const PagedKvCache& cache,
+    PageId page_id,
+    int token_offset) {
+  if (cache.CapacityPages() != capacity_pages_) {
+    throw std::invalid_argument("cache capacity does not match device page pool");
+  }
+  ValidatePageId(page_id);
+  const auto& page = cache.GetPage(page_id);
+  if (page.request_id == -1 || page.token_count == 0) {
+    throw std::invalid_argument("cannot upload a token from a free cache page");
+  }
+  if (token_offset < 0 || token_offset >= page.token_count) {
+    throw std::out_of_range("token_offset is outside the valid page prefix");
+  }
+
+  std::vector<float> key;
+  std::vector<float> value;
+  cache.CopyPageToken(page_id, token_offset, &key, &value);
+
+  const std::size_t token_element_offset =
+      PageElementOffset(page_id) +
+      static_cast<std::size_t>(token_offset) * elements_per_token();
+  DSD_CUDA_CHECK(cudaMemcpy(
+      key_storage_.get() + static_cast<std::ptrdiff_t>(token_element_offset),
+      key.data(),
+      static_cast<std::size_t>(elements_per_token()) * sizeof(float),
+      cudaMemcpyHostToDevice));
+  DSD_CUDA_CHECK(cudaMemcpy(
+      value_storage_.get() + static_cast<std::ptrdiff_t>(token_element_offset),
+      value.data(),
+      static_cast<std::size_t>(elements_per_token()) * sizeof(float),
+      cudaMemcpyHostToDevice));
+
+  const auto summary = cache.CopyPageSummary(page_id);
+  const std::size_t summary_offset =
+      static_cast<std::size_t>(page_id) * elements_per_token();
+  std::copy(
+      summary.begin(),
+      summary.end(),
+      host_page_summaries_.begin() + static_cast<std::ptrdiff_t>(summary_offset));
+  DSD_CUDA_CHECK(cudaMemcpy(
+      page_summaries_.get() + static_cast<std::ptrdiff_t>(summary_offset),
+      summary.data(),
+      static_cast<std::size_t>(elements_per_token()) * sizeof(float),
+      cudaMemcpyHostToDevice));
+
+  host_token_counts_[static_cast<std::size_t>(page_id)] = page.token_count;
+  host_live_mask_[static_cast<std::size_t>(page_id)] = 1;
+  DSD_CUDA_CHECK(cudaMemcpy(
+      page_token_counts_.get() + static_cast<std::ptrdiff_t>(page_id),
+      &page.token_count,
+      sizeof(int),
+      cudaMemcpyHostToDevice));
+  const std::uint8_t live_value = 1;
+  DSD_CUDA_CHECK(cudaMemcpy(
+      page_live_mask_.get() + static_cast<std::ptrdiff_t>(page_id),
+      &live_value,
+      sizeof(std::uint8_t),
+      cudaMemcpyHostToDevice));
+}
+
+void DevicePagePool::MarkPageFree(PageId page_id) {
+  ValidatePageId(page_id);
+
+  host_token_counts_[static_cast<std::size_t>(page_id)] = 0;
+  host_live_mask_[static_cast<std::size_t>(page_id)] = 0;
+  const std::size_t summary_offset =
+      static_cast<std::size_t>(page_id) * elements_per_token();
+  std::fill(
+      host_page_summaries_.begin() + static_cast<std::ptrdiff_t>(summary_offset),
+      host_page_summaries_.begin() +
+          static_cast<std::ptrdiff_t>(summary_offset + elements_per_token()),
+      0.0f);
+
+  const int token_count = 0;
+  DSD_CUDA_CHECK(cudaMemcpy(
+      page_token_counts_.get() + static_cast<std::ptrdiff_t>(page_id),
+      &token_count,
+      sizeof(int),
+      cudaMemcpyHostToDevice));
+  const std::uint8_t live_value = 0;
+  DSD_CUDA_CHECK(cudaMemcpy(
+      page_live_mask_.get() + static_cast<std::ptrdiff_t>(page_id),
+      &live_value,
+      sizeof(std::uint8_t),
+      cudaMemcpyHostToDevice));
+  DSD_CUDA_CHECK(cudaMemcpy(
+      page_summaries_.get() + static_cast<std::ptrdiff_t>(summary_offset),
+      host_page_summaries_.data() + static_cast<std::ptrdiff_t>(summary_offset),
+      static_cast<std::size_t>(elements_per_token()) * sizeof(float),
+      cudaMemcpyHostToDevice));
 }
 
 void DevicePagePool::DownloadPage(

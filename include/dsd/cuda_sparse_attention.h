@@ -27,6 +27,12 @@ class SparseCudaContext {
 
   SparseBatchCudaResult RunBatch(const std::vector<RequestState>& requests);
 
+  void SyncPageFromCache(const PagedKvCache& cache, PageId page_id);
+  void SyncAppendedToken(
+      const PagedKvCache& cache,
+      const AppendTokenResult& result);
+  void SyncFreedPages(const std::vector<PageId>& page_ids);
+
  private:
   const PagedKvCache* cache_ = nullptr;
   ModelConfig config_{};

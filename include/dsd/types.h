@@ -6,6 +6,12 @@ namespace dsd {
 
 using PageId = int;
 
+struct AppendTokenResult {
+  PageId page_id = -1;
+  int token_offset = 0;
+  bool allocated_new_page = false;
+};
+
 struct RequestState {
   int request_id = -1;
   std::vector<float> query;

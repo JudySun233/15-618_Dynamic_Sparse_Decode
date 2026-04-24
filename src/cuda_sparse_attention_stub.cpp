@@ -26,6 +26,26 @@ SparseBatchCudaResult SparseCudaContext::RunBatch(
       "rebuild with DSD_ENABLE_CUDA=ON.");
 }
 
+void SparseCudaContext::SyncPageFromCache(const PagedKvCache&, PageId) {
+  throw std::runtime_error(
+      "Sparse CUDA attention backend is unavailable. Load a CUDA toolkit and "
+      "rebuild with DSD_ENABLE_CUDA=ON.");
+}
+
+void SparseCudaContext::SyncAppendedToken(
+    const PagedKvCache&,
+    const AppendTokenResult&) {
+  throw std::runtime_error(
+      "Sparse CUDA attention backend is unavailable. Load a CUDA toolkit and "
+      "rebuild with DSD_ENABLE_CUDA=ON.");
+}
+
+void SparseCudaContext::SyncFreedPages(const std::vector<PageId>&) {
+  throw std::runtime_error(
+      "Sparse CUDA attention backend is unavailable. Load a CUDA toolkit and "
+      "rebuild with DSD_ENABLE_CUDA=ON.");
+}
+
 SparseDecodeResult SparseDecodeCuda(
     const PagedKvCache&,
     const RequestState&,

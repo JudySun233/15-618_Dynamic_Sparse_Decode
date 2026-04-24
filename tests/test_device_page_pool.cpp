@@ -229,6 +229,79 @@ bool CheckInvalidUsage() {
   return true;
 }
 
+bool CheckIncrementalTokenUploadAndFree() {
+  dsd::ModelConfig config;
+  config.num_heads = 2;
+  config.head_dim = 4;
+  config.page_size = 3;
+  config.top_k_pages = 8;
+  dsd::PagedKvCache cache(config, 4);
+  dsd::DevicePagePool device_pool(config, cache.CapacityPages());
+
+  const int elements_per_token = config.num_heads * config.head_dim;
+  const auto token0_key = MakeSequence(elements_per_token, 10.0f);
+  const auto token0_value = MakeSequence(elements_per_token, 100.0f);
+  const auto append0 = cache.AppendToken(23, token0_key, token0_value);
+  device_pool.UploadTokenFromCache(cache, append0.page_id, append0.token_offset);
+
+  std::vector<float> downloaded_keys;
+  std::vector<float> downloaded_values;
+  device_pool.DownloadPage(append0.page_id, &downloaded_keys, &downloaded_values);
+  if (downloaded_keys != token0_key || downloaded_values != token0_value) {
+    std::cerr << "incremental first-token upload did not match host cache\n";
+    return false;
+  }
+
+  const auto token1_key = MakeSequence(elements_per_token, 20.0f);
+  const auto token1_value = MakeSequence(elements_per_token, 200.0f);
+  const auto append1 = cache.AppendToken(23, token1_key, token1_value);
+  if (append1.page_id != append0.page_id || append1.token_offset != 1) {
+    std::cerr << "second token should append into same page\n";
+    return false;
+  }
+  device_pool.UploadTokenFromCache(cache, append1.page_id, append1.token_offset);
+
+  device_pool.DownloadPage(append0.page_id, &downloaded_keys, &downloaded_values);
+  std::vector<float> expected_keys = token0_key;
+  expected_keys.insert(expected_keys.end(), token1_key.begin(), token1_key.end());
+  std::vector<float> expected_values = token0_value;
+  expected_values.insert(expected_values.end(), token1_value.begin(), token1_value.end());
+  if (downloaded_keys != expected_keys || downloaded_values != expected_values) {
+    std::cerr << "incremental second-token upload did not preserve page prefix\n";
+    return false;
+  }
+
+  std::vector<int> token_counts;
+  std::vector<std::uint8_t> live_mask;
+  device_pool.DownloadMetadata(&token_counts, &live_mask);
+  if (token_counts[static_cast<std::size_t>(append0.page_id)] != 2 ||
+      live_mask[static_cast<std::size_t>(append0.page_id)] != 1) {
+    std::cerr << "incremental upload did not update metadata\n";
+    return false;
+  }
+
+  const auto released_pages = cache.ReleaseRequest(23);
+  for (const auto page_id : released_pages) {
+    device_pool.MarkPageFree(page_id);
+  }
+  device_pool.DownloadMetadata(&token_counts, &live_mask);
+  if (token_counts[static_cast<std::size_t>(append0.page_id)] != 0 ||
+      live_mask[static_cast<std::size_t>(append0.page_id)] != 0) {
+    std::cerr << "MarkPageFree did not clear metadata\n";
+    return false;
+  }
+  if (!ExpectThrows([&device_pool, append0]() {
+        std::vector<float> host_keys;
+        std::vector<float> host_values;
+        device_pool.DownloadPage(append0.page_id, &host_keys, &host_values);
+      })) {
+    std::cerr << "download after MarkPageFree should throw\n";
+    return false;
+  }
+
+  return true;
+}
+
 }  // namespace
 
 int main() {
@@ -247,6 +320,9 @@ int main() {
     return 1;
   }
   if (!CheckInvalidUsage()) {
+    return 1;
+  }
+  if (!CheckIncrementalTokenUploadAndFree()) {
     return 1;
   }
 
