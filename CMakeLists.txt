@@ -9,6 +9,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
 
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 option(DSD_ENABLE_CUDA "Build CUDA targets when a CUDA toolkit is available" ON)
 set(DSD_CUDA_ARCHITECTURES "90" CACHE STRING "CUDA architectures for device code")
 
@@ -65,7 +69,7 @@ if(DSD_HAVE_CUDA)
   add_library(dsd_cuda
     src/device_page_pool.cpp
     src/cuda/kernels.cu
-    src/cuda/sparse_attention.cu
+    src/cuda/sparse_batched_attention.cu
   )
 
   set_source_files_properties(src/device_page_pool.cpp PROPERTIES LANGUAGE CUDA)
@@ -79,7 +83,10 @@ if(DSD_HAVE_CUDA)
   target_include_directories(dsd_cuda PUBLIC ${PROJECT_SOURCE_DIR}/include ${DSD_CUDA_INCLUDE_DIR})
   target_link_directories(dsd_cuda PUBLIC ${DSD_CUDA_LIBRARY_DIR})
   target_compile_definitions(dsd_cuda PUBLIC DSD_HAVE_CUDA=1)
-  target_link_libraries(dsd_cuda PUBLIC ${DSD_CUDA_LIBRARY_DIR}/libcudart.so ${DSD_CUDA_LIBRARY_DIR}/libcudadevrt.a)
+  target_link_libraries(dsd_cuda PUBLIC
+    ${DSD_CUDA_LIBRARY_DIR}/libcudart.so
+    ${DSD_CUDA_LIBRARY_DIR}/libcudadevrt.a
+    ${CMAKE_DL_LIBS})
   target_link_libraries(dsd_core PUBLIC dsd_cuda)
 
   add_executable(dsd_device_page_pool_test tests/test_device_page_pool.cpp)

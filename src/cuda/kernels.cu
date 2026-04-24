@@ -23,9 +23,6 @@ struct PackedDenseBatch {
   std::vector<float> queries;
   std::vector<int> request_page_offsets;
   std::vector<int> request_page_ids;
-  std::vector<std::uint64_t> page_k_offsets;
-  std::vector<std::uint64_t> page_v_offsets;
-  std::vector<int> page_token_counts;
   int num_requests = 0;
   int num_heads = 0;
   int head_dim = 0;
@@ -64,17 +61,6 @@ PackedDenseBatch PackDenseBatch(
         request.candidate_page_ids.end());
     packed.request_page_offsets.push_back(
         static_cast<int>(packed.request_page_ids.size()));
-  }
-
-  const auto& pages = cache.Pages();
-  packed.page_k_offsets.resize(pages.size(), 0);
-  packed.page_v_offsets.resize(pages.size(), 0);
-  packed.page_token_counts.resize(pages.size(), 0);
-
-  for (const auto& page : pages) {
-    packed.page_k_offsets[static_cast<std::size_t>(page.id)] = page.k_offset;
-    packed.page_v_offsets[static_cast<std::size_t>(page.id)] = page.v_offset;
-    packed.page_token_counts[static_cast<std::size_t>(page.id)] = page.token_count;
   }
 
   return packed;
@@ -192,10 +178,24 @@ bool DenseAttentionCudaAvailable() {
   return status == cudaSuccess && device_count > 0;
 }
 
-DenseBatchResult DenseAttentionCudaBatch(
+DenseCudaContext::DenseCudaContext(
     const PagedKvCache& cache,
-    const std::vector<RequestState>& requests,
-    const ModelConfig& config) {
+    const ModelConfig& config)
+    : cache_(&cache),
+      config_(config),
+      elements_per_token_(config.num_heads * config.head_dim),
+      device_page_pool_(config, cache.CapacityPages()) {
+  if (!DenseAttentionCudaAvailable()) {
+    throw std::runtime_error("no CUDA-capable device is visible to the process");
+  }
+  if (config.head_dim <= 0 || config.head_dim > kMaxHeadDim) {
+    throw std::invalid_argument("head_dim must be in (0, 256] for CUDA baseline");
+  }
+  device_page_pool_.UploadAllFromCache(cache);
+}
+
+DenseBatchResult DenseCudaContext::RunBatch(
+    const std::vector<RequestState>& requests) {
   DenseBatchResult result;
   result.outputs.resize(requests.size());
 
@@ -203,11 +203,7 @@ DenseBatchResult DenseAttentionCudaBatch(
     return result;
   }
 
-  if (!DenseAttentionCudaAvailable()) {
-    throw std::runtime_error("no CUDA-capable device is visible to the process");
-  }
-
-  const PackedDenseBatch packed = PackDenseBatch(cache, requests, config);
+  const PackedDenseBatch packed = PackDenseBatch(*cache_, requests, config_);
   const std::size_t output_elements =
       static_cast<std::size_t>(packed.num_requests) * packed.elements_per_token;
   const float scale = 1.0f / std::sqrt(static_cast<float>(packed.head_dim));
@@ -217,11 +213,6 @@ DenseBatchResult DenseAttentionCudaBatch(
   DeviceArray<float> d_queries;
   DeviceArray<int> d_request_page_offsets;
   DeviceArray<int> d_request_page_ids;
-  DeviceArray<std::uint64_t> d_page_k_offsets;
-  DeviceArray<std::uint64_t> d_page_v_offsets;
-  DeviceArray<int> d_page_token_counts;
-  DeviceArray<float> d_key_pool;
-  DeviceArray<float> d_value_pool;
   DeviceArray<float> d_outputs;
 
   d_queries.Allocate(packed.queries.size(), &overheads->time_malloc_ms);
@@ -229,14 +220,6 @@ DenseBatchResult DenseAttentionCudaBatch(
       packed.request_page_offsets.size(), &overheads->time_malloc_ms);
   d_request_page_ids.Allocate(
       packed.request_page_ids.size(), &overheads->time_malloc_ms);
-  d_page_k_offsets.Allocate(
-      packed.page_k_offsets.size(), &overheads->time_malloc_ms);
-  d_page_v_offsets.Allocate(
-      packed.page_v_offsets.size(), &overheads->time_malloc_ms);
-  d_page_token_counts.Allocate(
-      packed.page_token_counts.size(), &overheads->time_malloc_ms);
-  d_key_pool.Allocate(cache.KeyPool().size(), &overheads->time_malloc_ms);
-  d_value_pool.Allocate(cache.ValuePool().size(), &overheads->time_malloc_ms);
   d_outputs.Allocate(output_elements, &overheads->time_malloc_ms);
 
   d_queries.CopyFromHost(packed.queries, &overheads->time_memcpy_h2d_ms);
@@ -244,14 +227,6 @@ DenseBatchResult DenseAttentionCudaBatch(
       packed.request_page_offsets, &overheads->time_memcpy_h2d_ms);
   d_request_page_ids.CopyFromHost(
       packed.request_page_ids, &overheads->time_memcpy_h2d_ms);
-  d_page_k_offsets.CopyFromHost(
-      packed.page_k_offsets, &overheads->time_memcpy_h2d_ms);
-  d_page_v_offsets.CopyFromHost(
-      packed.page_v_offsets, &overheads->time_memcpy_h2d_ms);
-  d_page_token_counts.CopyFromHost(
-      packed.page_token_counts, &overheads->time_memcpy_h2d_ms);
-  d_key_pool.CopyFromHost(cache.KeyPool(), &overheads->time_memcpy_h2d_ms);
-  d_value_pool.CopyFromHost(cache.ValuePool(), &overheads->time_memcpy_h2d_ms);
 
   cudaEvent_t start_event = nullptr;
   cudaEvent_t stop_event = nullptr;
@@ -270,11 +245,11 @@ DenseBatchResult DenseAttentionCudaBatch(
         d_queries.get(),
         d_request_page_offsets.get(),
         d_request_page_ids.get(),
-        d_page_k_offsets.get(),
-        d_page_v_offsets.get(),
-        d_page_token_counts.get(),
-        d_key_pool.get(),
-        d_value_pool.get(),
+        device_page_pool_.page_k_offsets_device(),
+        device_page_pool_.page_v_offsets_device(),
+        device_page_pool_.page_token_counts_device(),
+        device_page_pool_.key_base_device(),
+        device_page_pool_.value_base_device(),
         packed.num_requests,
         packed.num_heads,
         packed.head_dim,
@@ -298,11 +273,6 @@ DenseBatchResult DenseAttentionCudaBatch(
   std::vector<float> host_outputs;
   d_outputs.CopyToHost(&host_outputs, &overheads->time_memcpy_d2h_ms);
   d_outputs.Reset(&overheads->time_free_ms);
-  d_value_pool.Reset(&overheads->time_free_ms);
-  d_key_pool.Reset(&overheads->time_free_ms);
-  d_page_token_counts.Reset(&overheads->time_free_ms);
-  d_page_v_offsets.Reset(&overheads->time_free_ms);
-  d_page_k_offsets.Reset(&overheads->time_free_ms);
   d_request_page_ids.Reset(&overheads->time_free_ms);
   d_request_page_offsets.Reset(&overheads->time_free_ms);
   d_queries.Reset(&overheads->time_free_ms);
@@ -319,6 +289,14 @@ DenseBatchResult DenseAttentionCudaBatch(
   }
 
   return result;
+}
+
+DenseBatchResult DenseAttentionCudaBatch(
+    const PagedKvCache& cache,
+    const std::vector<RequestState>& requests,
+    const ModelConfig& config) {
+  DenseCudaContext context(cache, config);
+  return context.RunBatch(requests);
 }
 
 }  // namespace dsd

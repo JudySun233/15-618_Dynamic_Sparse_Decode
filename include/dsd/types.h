@@ -68,4 +68,11 @@ struct BatchDecodeResult {
   StageTimings aggregate_timings;
 };
 
+struct SparseBatchCudaResult {
+  std::vector<SparseDecodeResult> per_request;
+  StageTimings aggregate_timings;
+  RuntimeOverheadTimings runtime_overheads;
+  double kernel_ms = 0.0;
+};
+
 }  // namespace dsd

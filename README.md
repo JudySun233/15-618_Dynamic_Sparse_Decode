@@ -49,7 +49,7 @@ export LIBRARY_PATH=/opt/packages/cuda/v12.4.0/lib64:$LIBRARY_PATH
 export LD_LIBRARY_PATH=/opt/packages/cuda/v12.4.0/lib64:$LD_LIBRARY_PATH
 
 rm -rf build
-cmake -S . -B build -DDSD_ENABLE_CUDA=ON -DDSD_CUDA_ARCHITECTURES=90
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDSD_ENABLE_CUDA=ON -DDSD_CUDA_ARCHITECTURES=90
 ```
 
 ## Run
@@ -74,13 +74,13 @@ Run dense CUDA correctness test:
 Run the benchmark:
 
 ```bash
-./build/dsd_bench [top_k_pages] [batch_size] [min_context_tokens] [max_context_tokens] [seed] [iterations] [warmup]
+./build/dsd_bench [top_k_pages] [batch_size] [min_context_tokens] [max_context_tokens] [seed] [iterations] [warmup] [num_heads] [head_dim] [page_size]
 ```
 
 Example:
 
 ```bash
-./build/dsd_bench 8 16 512 2048 7 10 2
+./build/dsd_bench 8 16 512 2048 7 10 2 32 128 16
 ```
 
 Single-request example:
@@ -90,7 +90,12 @@ Single-request example:
 ```
 
 ## Benchmark Output
-`dsd_bench` now prints two tables.
+`dsd_bench` now prints three sections before the accuracy summary.
+
+`Analytical Ceiling`
+- exact batch totals for context tokens, candidate pages, and selected tokens
+- dense, current sparse, and target sparse byte/FLOP estimates
+- H100 bandwidth and FP32 lower-bound times
 
 `End-to-End`
 - Total wall-clock time for each path
@@ -100,7 +105,7 @@ Single-request example:
 - `dense_cpu`: CPU dense attention time
 - `sparse_cpu`: CPU score, top-k, gather, attention breakdown
 - `dense_gpu`: CUDA dense attention kernel time
-- `sparse_gpu`: CPU score/top-k plus GPU gather/attention breakdown
+- `sparse_gpu`: batched GPU score/top-k plus fused sparse attention breakdown
 
 It also prints an `Accuracy` block with max-absolute-difference comparisons:
 - `sparse_cpu` vs `dense_cpu`
@@ -134,8 +139,8 @@ src/
   device_page_pool.cpp     CUDA-backed page-pool implementation
   cuda_dense_attention_stub.cpp
   cuda_sparse_attention_stub.cpp
-  cuda/kernels.cu          dense CUDA baseline
-  cuda/sparse_attention.cu sparse CUDA score/top-k/gather/attention
+  cuda/kernels.cu               dense CUDA baseline
+  cuda/sparse_batched_attention.cu batched sparse CUDA score/top-k/fused-attention
 
 benchmarks/
   bench_decode.cpp         benchmark harness for dense/sparse CPU/GPU comparison
@@ -149,6 +154,6 @@ tests/
 ```
 
 ## Notes
-- The current `sparse_gpu` path is correctness-first and not yet batch-optimized.
-- In the current implementation, `sparse_gpu` runs score/top-k/gather/attention on GPU, while sparse layout preparation still includes host-side metadata work.
-- `sparse_gpu` total time includes kernel time plus host/device copy, allocation, and synchronization overhead.
+- `dense_gpu` and `sparse_gpu` both use persistent HBM contexts for static KV/page data.
+- `sparse_gpu` is now batch-oriented; gather is fused into attention in the fast path, so `gather_ms` is expected to be zero.
+- `sparse_gpu` total time still includes host/device copy, kernel launch, synchronization, and sparse layout preparation overhead.

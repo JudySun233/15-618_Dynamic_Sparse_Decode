@@ -23,10 +23,16 @@ DevicePagePool::DevicePagePool(ModelConfig config, int capacity_pages)
       host_live_mask_(static_cast<std::size_t>(capacity_pages_), 0),
       host_k_offsets_(static_cast<std::size_t>(capacity_pages_), 0),
       host_v_offsets_(static_cast<std::size_t>(capacity_pages_), 0),
+      host_page_summaries_(
+          static_cast<std::size_t>(capacity_pages_) *
+              static_cast<std::size_t>(elements_per_token()),
+          0.0f),
       key_storage_(
           static_cast<std::size_t>(capacity_pages_) * elements_per_page()),
       value_storage_(
           static_cast<std::size_t>(capacity_pages_) * elements_per_page()),
+      page_summaries_(
+          static_cast<std::size_t>(capacity_pages_) * elements_per_token()),
       page_token_counts_(static_cast<std::size_t>(capacity_pages_)),
       page_live_mask_(static_cast<std::size_t>(capacity_pages_)),
       page_k_offsets_(static_cast<std::size_t>(capacity_pages_)),
@@ -42,13 +48,16 @@ DevicePagePool::DevicePagePool(ModelConfig config, int capacity_pages)
   page_live_mask_.CopyFromHost(host_live_mask_);
   page_k_offsets_.CopyFromHost(host_k_offsets_);
   page_v_offsets_.CopyFromHost(host_v_offsets_);
+  page_summaries_.CopyFromHost(host_page_summaries_);
 }
 
 void DevicePagePool::Reset() {
   std::fill(host_token_counts_.begin(), host_token_counts_.end(), 0);
   std::fill(host_live_mask_.begin(), host_live_mask_.end(), 0);
+  std::fill(host_page_summaries_.begin(), host_page_summaries_.end(), 0.0f);
   page_token_counts_.CopyFromHost(host_token_counts_);
   page_live_mask_.CopyFromHost(host_live_mask_);
+  page_summaries_.CopyFromHost(host_page_summaries_);
 }
 
 void DevicePagePool::UploadPage(
@@ -79,6 +88,32 @@ void DevicePagePool::UploadPage(
       valid_elements * sizeof(float),
       cudaMemcpyHostToDevice));
 
+  const std::size_t summary_offset =
+      static_cast<std::size_t>(page_id) * elements_per_token();
+  std::fill(
+      host_page_summaries_.begin() + static_cast<std::ptrdiff_t>(summary_offset),
+      host_page_summaries_.begin() +
+          static_cast<std::ptrdiff_t>(summary_offset + elements_per_token()),
+      0.0f);
+  for (int token = 0; token < token_count; ++token) {
+    const std::size_t token_offset =
+        static_cast<std::size_t>(token) * elements_per_token();
+    for (int i = 0; i < elements_per_token(); ++i) {
+      host_page_summaries_[summary_offset + static_cast<std::size_t>(i)] +=
+          host_keys[token_offset + static_cast<std::size_t>(i)];
+    }
+  }
+  const float inv_token_count = 1.0f / static_cast<float>(token_count);
+  for (int i = 0; i < elements_per_token(); ++i) {
+    host_page_summaries_[summary_offset + static_cast<std::size_t>(i)] *=
+        inv_token_count;
+  }
+  DSD_CUDA_CHECK(cudaMemcpy(
+      page_summaries_.get() + static_cast<std::ptrdiff_t>(summary_offset),
+      host_page_summaries_.data() + static_cast<std::ptrdiff_t>(summary_offset),
+      static_cast<std::size_t>(elements_per_token()) * sizeof(float),
+      cudaMemcpyHostToDevice));
+
   host_token_counts_[static_cast<std::size_t>(page_id)] = token_count;
   host_live_mask_[static_cast<std::size_t>(page_id)] = 1;
   DSD_CUDA_CHECK(cudaMemcpy(
@@ -92,6 +127,28 @@ void DevicePagePool::UploadPage(
       &live_value,
       sizeof(std::uint8_t),
       cudaMemcpyHostToDevice));
+}
+
+void DevicePagePool::UploadAllFromCache(const PagedKvCache& cache) {
+  if (cache.CapacityPages() != capacity_pages_) {
+    throw std::invalid_argument("cache capacity does not match device page pool");
+  }
+
+  key_storage_.CopyFromHost(cache.KeyPool());
+  value_storage_.CopyFromHost(cache.ValuePool());
+  page_summaries_.CopyFromHost(cache.PageSummaryPool());
+
+  std::fill(host_token_counts_.begin(), host_token_counts_.end(), 0);
+  std::fill(host_live_mask_.begin(), host_live_mask_.end(), 0);
+  const auto& pages = cache.Pages();
+  for (const auto& page : pages) {
+    host_token_counts_[static_cast<std::size_t>(page.id)] = page.token_count;
+    host_live_mask_[static_cast<std::size_t>(page.id)] =
+        static_cast<std::uint8_t>(page.token_count > 0 ? 1 : 0);
+  }
+  host_page_summaries_ = cache.PageSummaryPool();
+  page_token_counts_.CopyFromHost(host_token_counts_);
+  page_live_mask_.CopyFromHost(host_live_mask_);
 }
 
 void DevicePagePool::UploadPageFromCache(const PagedKvCache& cache, PageId page_id) {

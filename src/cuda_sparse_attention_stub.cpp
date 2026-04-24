@@ -8,6 +8,24 @@ bool SparseAttentionCudaAvailable() {
   return false;
 }
 
+SparseCudaContext::SparseCudaContext(
+    const PagedKvCache&,
+    const ModelConfig&,
+    int,
+    int,
+    int) {
+  throw std::runtime_error(
+      "Sparse CUDA attention backend is unavailable. Load a CUDA toolkit and "
+      "rebuild with DSD_ENABLE_CUDA=ON.");
+}
+
+SparseBatchCudaResult SparseCudaContext::RunBatch(
+    const std::vector<RequestState>&) {
+  throw std::runtime_error(
+      "Sparse CUDA attention backend is unavailable. Load a CUDA toolkit and "
+      "rebuild with DSD_ENABLE_CUDA=ON.");
+}
+
 SparseDecodeResult SparseDecodeCuda(
     const PagedKvCache&,
     const RequestState&,

@@ -37,12 +37,15 @@ class DevicePagePool {
       std::vector<int>* token_counts,
       std::vector<std::uint8_t>* live_mask) const;
 
+  void UploadAllFromCache(const PagedKvCache& cache);
+
   int capacity_pages() const { return capacity_pages_; }
   int elements_per_token() const;
   int elements_per_page() const;
 
   const float* key_base_device() const { return key_storage_.get(); }
   const float* value_base_device() const { return value_storage_.get(); }
+  const float* page_summary_base_device() const { return page_summaries_.get(); }
   const int* page_token_counts_device() const { return page_token_counts_.get(); }
   const std::uint8_t* page_live_mask_device() const {
     return page_live_mask_.get();
@@ -61,9 +64,11 @@ class DevicePagePool {
   std::vector<std::uint8_t> host_live_mask_;
   std::vector<std::uint64_t> host_k_offsets_;
   std::vector<std::uint64_t> host_v_offsets_;
+  std::vector<float> host_page_summaries_;
 
   DeviceArray<float> key_storage_;
   DeviceArray<float> value_storage_;
+  DeviceArray<float> page_summaries_;
   DeviceArray<int> page_token_counts_;
   DeviceArray<std::uint8_t> page_live_mask_;
   DeviceArray<std::uint64_t> page_k_offsets_;

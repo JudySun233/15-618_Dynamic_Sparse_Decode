@@ -15,7 +15,12 @@ const std::vector<PageId>& EmptyPageList() {
 }  // namespace
 
 PagedKvCache::PagedKvCache(ModelConfig config, int capacity_pages)
-    : config_(config), page_pool_(config, capacity_pages) {
+    : config_(config),
+      page_pool_(config, capacity_pages),
+      page_summary_pool_(
+          static_cast<std::size_t>(capacity_pages) *
+              static_cast<std::size_t>(config.num_heads * config.head_dim),
+          0.0f) {
   pages_.reserve(static_cast<std::size_t>(capacity_pages));
   for (PageId page_id = 0; page_id < capacity_pages; ++page_id) {
     pages_.push_back(MakeFreeDescriptor(page_id));
@@ -42,9 +47,22 @@ PageId PagedKvCache::AppendPage(
       static_cast<int>(request_to_pages_[request_id].size()) * config_.page_size;
   const auto page_offset =
       static_cast<std::size_t>(page_id) * ElementsPerPage();
+  auto* summary_ptr = page_summary_pool_.data() +
+      static_cast<std::ptrdiff_t>(static_cast<std::size_t>(page_id) * ElementsPerToken());
 
   std::copy(keys.begin(), keys.end(), page_pool_.get_k_page_ptr(page_id));
   std::copy(values.begin(), values.end(), page_pool_.get_v_page_ptr(page_id));
+  std::fill(summary_ptr, summary_ptr + ElementsPerToken(), 0.0f);
+  for (int token = 0; token < token_count; ++token) {
+    const auto base = static_cast<std::size_t>(token) * ElementsPerToken();
+    for (int i = 0; i < ElementsPerToken(); ++i) {
+      summary_ptr[i] += keys[base + static_cast<std::size_t>(i)];
+    }
+  }
+  const float inv_token_count = 1.0f / static_cast<float>(token_count);
+  for (int i = 0; i < ElementsPerToken(); ++i) {
+    summary_ptr[i] *= inv_token_count;
+  }
 
   pages_[static_cast<std::size_t>(page_id)] = PageDescriptor{
       page_id,
@@ -63,6 +81,7 @@ void PagedKvCache::Reset() {
   request_to_pages_.clear();
   active_page_count_ = 0;
   page_pool_.reset_pool();
+  std::fill(page_summary_pool_.begin(), page_summary_pool_.end(), 0.0f);
   for (PageId page_id = 0; page_id < static_cast<PageId>(pages_.size()); ++page_id) {
     pages_[static_cast<std::size_t>(page_id)] = MakeFreeDescriptor(page_id);
   }
@@ -109,26 +128,20 @@ std::vector<float> PagedKvCache::CopyPageValues(PageId page_id) const {
 }
 
 std::vector<float> PagedKvCache::BuildPageSummary(PageId page_id) const {
+  return CopyPageSummary(page_id);
+}
+
+std::vector<float> PagedKvCache::CopyPageSummary(PageId page_id) const {
   const auto& page = GetPage(page_id);
-  const int elements_per_token = ElementsPerToken();
-  std::vector<float> summary(static_cast<std::size_t>(elements_per_token), 0.0f);
+  const auto summary_offset =
+      static_cast<std::size_t>(page_id) * ElementsPerToken();
+  const auto begin =
+      page_summary_pool_.begin() + static_cast<std::ptrdiff_t>(summary_offset);
+  const auto end = begin + ElementsPerToken();
   if (page.token_count == 0) {
-    return summary;
+    return std::vector<float>(static_cast<std::size_t>(ElementsPerToken()), 0.0f);
   }
-
-  const auto* key_ptr = page_pool_.get_k_page_ptr(page_id);
-
-  for (int token = 0; token < page.token_count; ++token) {
-    const auto base = static_cast<std::size_t>(token) * elements_per_token;
-    for (int i = 0; i < elements_per_token; ++i) {
-      summary[static_cast<std::size_t>(i)] += key_ptr[base + i];
-    }
-  }
-
-  for (float& value : summary) {
-    value /= static_cast<float>(page.token_count);
-  }
-  return summary;
+  return std::vector<float>(begin, end);
 }
 
 int PagedKvCache::TotalPages() const {

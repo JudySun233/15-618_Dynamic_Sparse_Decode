@@ -55,6 +55,7 @@ bool CheckPagedCacheOps() {
   }
 
   const auto summary = cache.BuildPageSummary(page0_id);
+  const auto copied_summary = cache.CopyPageSummary(page0_id);
   std::vector<float> expected_summary(
       static_cast<std::size_t>(elements_per_token), 0.0f);
   for (int token = 0; token < 4; ++token) {
@@ -67,8 +68,20 @@ bool CheckPagedCacheOps() {
     value /= 4.0f;
   }
 
-  if (dsd::MaxAbsDiff(summary, expected_summary) > 1e-6f) {
+  if (dsd::MaxAbsDiff(summary, expected_summary) > 1e-6f ||
+      dsd::MaxAbsDiff(copied_summary, expected_summary) > 1e-6f) {
     std::cerr << "page summary changed under the PagePool-backed cache\n";
+    return false;
+  }
+
+  const auto& summary_pool = cache.PageSummaryPool();
+  const auto summary_offset =
+      static_cast<std::size_t>(page0_id) * static_cast<std::size_t>(elements_per_token);
+  const std::vector<float> pooled_summary(
+      summary_pool.begin() + static_cast<std::ptrdiff_t>(summary_offset),
+      summary_pool.begin() + static_cast<std::ptrdiff_t>(summary_offset + elements_per_token));
+  if (dsd::MaxAbsDiff(pooled_summary, expected_summary) > 1e-6f) {
+    std::cerr << "page summary pool contents were incorrect\n";
     return false;
   }
 
@@ -76,6 +89,12 @@ bool CheckPagedCacheOps() {
   if (cache.TotalPages() != 0 || !cache.GetRequestPages(9).empty()) {
     std::cerr << "cache reset did not clear active state\n";
     return false;
+  }
+  for (float value : cache.PageSummaryPool()) {
+    if (value != 0.0f) {
+      std::cerr << "cache reset did not clear summary pool\n";
+      return false;
+    }
   }
 
   const auto recycled_page_id = cache.AppendPage(5, page1_keys, page1_values, 2);
