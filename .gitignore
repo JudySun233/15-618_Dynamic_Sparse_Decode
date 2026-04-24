@@ -6,3 +6,4 @@ results/
 *.a
 *.out
 *.log
+.venv*/
