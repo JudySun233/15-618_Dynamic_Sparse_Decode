@@ -15,9 +15,12 @@ const std::vector<PageId>& EmptyPageList() {
 
 }  // namespace
 
-PagedKvCache::PagedKvCache(ModelConfig config, int capacity_pages)
+PagedKvCache::PagedKvCache(
+    ModelConfig config,
+    int capacity_pages,
+    bool allocate_kv_storage)
     : config_(config),
-      page_pool_(config, capacity_pages),
+      page_pool_(config, capacity_pages, allocate_kv_storage),
       page_summary_pool_(
           static_cast<std::size_t>(capacity_pages) *
               static_cast<std::size_t>(config.num_heads * config.head_dim),
@@ -36,10 +39,38 @@ PageId PagedKvCache::AppendPage(
   if (token_count <= 0 || token_count > config_.page_size) {
     throw std::invalid_argument("token_count must be in (0, page_size]");
   }
-
   const std::size_t expected_elements =
       static_cast<std::size_t>(token_count) * ElementsPerToken();
   if (keys.size() != expected_elements || values.size() != expected_elements) {
+    throw std::invalid_argument("page payload does not match expected size");
+  }
+  return AppendPage(request_id, keys.data(), values.data(), token_count);
+}
+
+PageId PagedKvCache::AppendPage(
+    int request_id,
+    const float* keys,
+    const float* values,
+    int token_count) {
+  return AppendPage(request_id, keys, values, token_count, true);
+}
+
+PageId PagedKvCache::AppendPage(
+    int request_id,
+    const float* keys,
+    const float* values,
+    int token_count,
+    bool compute_summary) {
+  if (token_count <= 0 || token_count > config_.page_size) {
+    throw std::invalid_argument("token_count must be in (0, page_size]");
+  }
+
+  const std::size_t expected_elements =
+      static_cast<std::size_t>(token_count) * ElementsPerToken();
+  if (expected_elements > 0 && (keys == nullptr || values == nullptr)) {
+    throw std::invalid_argument("page payload pointers must be non-null");
+  }
+  if (expected_elements == 0) {
     throw std::invalid_argument("page payload does not match expected size");
   }
 
@@ -49,18 +80,22 @@ PageId PagedKvCache::AppendPage(
       static_cast<std::size_t>(page_id) * ElementsPerPage();
   auto* summary_ptr = MutablePageSummary(page_id);
 
-  std::copy(keys.begin(), keys.end(), page_pool_.get_k_page_ptr(page_id));
-  std::copy(values.begin(), values.end(), page_pool_.get_v_page_ptr(page_id));
+  std::copy(keys, keys + static_cast<std::ptrdiff_t>(expected_elements),
+            page_pool_.get_k_page_ptr(page_id));
+  std::copy(values, values + static_cast<std::ptrdiff_t>(expected_elements),
+            page_pool_.get_v_page_ptr(page_id));
   std::fill(summary_ptr, summary_ptr + ElementsPerToken(), 0.0f);
-  for (int token = 0; token < token_count; ++token) {
-    const auto base = static_cast<std::size_t>(token) * ElementsPerToken();
-    for (int i = 0; i < ElementsPerToken(); ++i) {
-      summary_ptr[i] += keys[base + static_cast<std::size_t>(i)];
+  if (compute_summary) {
+    for (int token = 0; token < token_count; ++token) {
+      const auto base = static_cast<std::size_t>(token) * ElementsPerToken();
+      for (int i = 0; i < ElementsPerToken(); ++i) {
+        summary_ptr[i] += keys[base + static_cast<std::size_t>(i)];
+      }
     }
-  }
-  const float inv_token_count = 1.0f / static_cast<float>(token_count);
-  for (int i = 0; i < ElementsPerToken(); ++i) {
-    summary_ptr[i] *= inv_token_count;
+    const float inv_token_count = 1.0f / static_cast<float>(token_count);
+    for (int i = 0; i < ElementsPerToken(); ++i) {
+      summary_ptr[i] *= inv_token_count;
+    }
   }
 
   pages_[static_cast<std::size_t>(page_id)] = PageDescriptor{
@@ -76,20 +111,88 @@ PageId PagedKvCache::AppendPage(
   return page_id;
 }
 
+std::vector<PageId> PagedKvCache::ReservePagesForRequest(
+    int request_id,
+    const std::vector<int>& token_counts) {
+  std::vector<PageId> page_ids;
+  page_ids.reserve(token_counts.size());
+  if (token_counts.empty()) {
+    return page_ids;
+  }
+
+  for (int token_count : token_counts) {
+    if (token_count <= 0 || token_count > config_.page_size) {
+      throw std::invalid_argument("token_count must be in (0, page_size]");
+    }
+  }
+
+  for (std::size_t i = 0; i < token_counts.size(); ++i) {
+    page_ids.push_back(page_pool_.allocate_page());
+  }
+
+  std::sort(page_ids.begin(), page_ids.end());
+
+  int start_token = NextStartTokenForRequest(request_id);
+  auto& request_pages = request_to_pages_[request_id];
+  for (std::size_t i = 0; i < page_ids.size(); ++i) {
+    const PageId page_id = page_ids[i];
+    const int token_count = token_counts[i];
+    const auto page_offset =
+        static_cast<std::size_t>(page_id) * ElementsPerPage();
+    std::fill(
+        MutablePageSummary(page_id),
+        MutablePageSummary(page_id) + ElementsPerToken(),
+        0.0f);
+    pages_[static_cast<std::size_t>(page_id)] = PageDescriptor{
+        page_id,
+        request_id,
+        start_token,
+        token_count,
+        page_offset,
+        page_offset,
+    };
+    request_pages.push_back(page_id);
+    start_token += token_count;
+    ++active_page_count_;
+  }
+
+  return page_ids;
+}
+
 AppendTokenResult PagedKvCache::AppendToken(
     int request_id,
     const std::vector<float>& key,
     const std::vector<float>& value) {
+  return AppendToken(request_id, key, value, false);
+}
+
+AppendTokenResult PagedKvCache::AppendToken(
+    int request_id,
+    const std::vector<float>& key,
+    const std::vector<float>& value,
+    bool force_new_page) {
   const int elements_per_token = ElementsPerToken();
   if (static_cast<int>(key.size()) != elements_per_token ||
       static_cast<int>(value.size()) != elements_per_token) {
     throw std::invalid_argument("token payload does not match expected size");
   }
+  return AppendToken(request_id, key.data(), value.data(), force_new_page);
+}
+
+AppendTokenResult PagedKvCache::AppendToken(
+    int request_id,
+    const float* key,
+    const float* value,
+    bool force_new_page) {
+  const int elements_per_token = ElementsPerToken();
+  if (key == nullptr || value == nullptr) {
+    throw std::invalid_argument("token payload pointers must be non-null");
+  }
 
   auto& request_pages = request_to_pages_[request_id];
   bool allocated_new_page = false;
   PageId page_id = -1;
-  if (request_pages.empty() ||
+  if (force_new_page || request_pages.empty() ||
       pages_[static_cast<std::size_t>(request_pages.back())].token_count >=
           config_.page_size) {
     page_id = page_pool_.allocate_page();
@@ -122,19 +225,129 @@ AppendTokenResult PagedKvCache::AppendToken(
   auto* v_page = page_pool_.get_v_page_ptr(page_id);
   const auto element_offset =
       static_cast<std::ptrdiff_t>(token_offset) * elements_per_token;
-  std::copy(key.begin(), key.end(), k_page + element_offset);
-  std::copy(value.begin(), value.end(), v_page + element_offset);
+  std::copy(key, key + elements_per_token, k_page + element_offset);
+  std::copy(value, value + elements_per_token, v_page + element_offset);
 
   auto* summary_ptr = MutablePageSummary(page_id);
   const float old_count = static_cast<float>(page.token_count);
   const float new_count = old_count + 1.0f;
   for (int i = 0; i < elements_per_token; ++i) {
     summary_ptr[i] =
-        (summary_ptr[i] * old_count + key[static_cast<std::size_t>(i)]) /
+        (summary_ptr[i] * old_count + key[i]) /
         new_count;
   }
   ++page.token_count;
 
+  return AppendTokenResult{page_id, token_offset, allocated_new_page};
+}
+
+AppendTokenResult PagedKvCache::AppendTokenMetadataOnly(
+    int request_id,
+    const std::vector<float>& key,
+    bool force_new_page) {
+  const int elements_per_token = ElementsPerToken();
+  if (static_cast<int>(key.size()) != elements_per_token) {
+    throw std::invalid_argument("token payload does not match expected size");
+  }
+  return AppendTokenMetadataOnly(request_id, key.data(), force_new_page);
+}
+
+AppendTokenResult PagedKvCache::AppendTokenMetadataOnly(
+    int request_id,
+    const float* key,
+    bool force_new_page) {
+  const int elements_per_token = ElementsPerToken();
+  if (key == nullptr) {
+    throw std::invalid_argument("token payload pointer must be non-null");
+  }
+
+  auto& request_pages = request_to_pages_[request_id];
+  bool allocated_new_page = false;
+  PageId page_id = -1;
+  if (force_new_page || request_pages.empty() ||
+      pages_[static_cast<std::size_t>(request_pages.back())].token_count >=
+          config_.page_size) {
+    page_id = page_pool_.allocate_page();
+    const auto page_offset =
+        static_cast<std::size_t>(page_id) * ElementsPerPage();
+    pages_[static_cast<std::size_t>(page_id)] = PageDescriptor{
+        page_id,
+        request_id,
+        NextStartTokenForRequest(request_id),
+        0,
+        page_offset,
+        page_offset,
+    };
+    std::fill(
+        MutablePageSummary(page_id),
+        MutablePageSummary(page_id) + elements_per_token,
+        0.0f);
+    request_pages.push_back(page_id);
+    ++active_page_count_;
+    allocated_new_page = true;
+  } else {
+    page_id = request_pages.back();
+  }
+
+  auto& page = pages_[static_cast<std::size_t>(page_id)];
+  if (page.request_id != request_id || page.token_count < 0 ||
+      page.token_count >= config_.page_size) {
+    throw std::runtime_error("request tail page is inconsistent");
+  }
+
+  const int token_offset = page.token_count;
+  auto* summary_ptr = MutablePageSummary(page_id);
+  const float old_count = static_cast<float>(page.token_count);
+  const float new_count = old_count + 1.0f;
+  for (int i = 0; i < elements_per_token; ++i) {
+    summary_ptr[i] =
+        (summary_ptr[i] * old_count + key[i]) /
+        new_count;
+  }
+  ++page.token_count;
+
+  return AppendTokenResult{page_id, token_offset, allocated_new_page};
+}
+
+AppendTokenResult PagedKvCache::AppendTokenMetadataOnly(
+    int request_id,
+    bool force_new_page) {
+  auto& request_pages = request_to_pages_[request_id];
+  bool allocated_new_page = false;
+  PageId page_id = -1;
+  if (force_new_page || request_pages.empty() ||
+      pages_[static_cast<std::size_t>(request_pages.back())].token_count >=
+          config_.page_size) {
+    page_id = page_pool_.allocate_page();
+    const auto page_offset =
+        static_cast<std::size_t>(page_id) * ElementsPerPage();
+    pages_[static_cast<std::size_t>(page_id)] = PageDescriptor{
+        page_id,
+        request_id,
+        NextStartTokenForRequest(request_id),
+        0,
+        page_offset,
+        page_offset,
+    };
+    std::fill(
+        MutablePageSummary(page_id),
+        MutablePageSummary(page_id) + ElementsPerToken(),
+        0.0f);
+    request_pages.push_back(page_id);
+    ++active_page_count_;
+    allocated_new_page = true;
+  } else {
+    page_id = request_pages.back();
+  }
+
+  auto& page = pages_[static_cast<std::size_t>(page_id)];
+  if (page.request_id != request_id || page.token_count < 0 ||
+      page.token_count >= config_.page_size) {
+    throw std::runtime_error("request tail page is inconsistent");
+  }
+
+  const int token_offset = page.token_count;
+  ++page.token_count;
   return AppendTokenResult{page_id, token_offset, allocated_new_page};
 }
 

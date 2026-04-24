@@ -21,7 +21,10 @@ struct PageDescriptor {
 
 class PagedKvCache {
  public:
-  explicit PagedKvCache(ModelConfig config, int capacity_pages = 1024);
+  explicit PagedKvCache(
+      ModelConfig config,
+      int capacity_pages = 1024,
+      bool allocate_kv_storage = true);
 
   PageId AppendPage(
       int request_id,
@@ -29,10 +32,53 @@ class PagedKvCache {
       const std::vector<float>& values,
       int token_count);
 
+  PageId AppendPage(
+      int request_id,
+      const float* keys,
+      const float* values,
+      int token_count);
+
+  PageId AppendPage(
+      int request_id,
+      const float* keys,
+      const float* values,
+      int token_count,
+      bool compute_summary);
+
+  std::vector<PageId> ReservePagesForRequest(
+      int request_id,
+      const std::vector<int>& token_counts);
+
   AppendTokenResult AppendToken(
       int request_id,
       const std::vector<float>& key,
       const std::vector<float>& value);
+
+  AppendTokenResult AppendToken(
+      int request_id,
+      const std::vector<float>& key,
+      const std::vector<float>& value,
+      bool force_new_page);
+
+  AppendTokenResult AppendToken(
+      int request_id,
+      const float* key,
+      const float* value,
+      bool force_new_page);
+
+  AppendTokenResult AppendTokenMetadataOnly(
+      int request_id,
+      const std::vector<float>& key,
+      bool force_new_page);
+
+  AppendTokenResult AppendTokenMetadataOnly(
+      int request_id,
+      const float* key,
+      bool force_new_page);
+
+  AppendTokenResult AppendTokenMetadataOnly(
+      int request_id,
+      bool force_new_page);
 
   std::vector<PageId> ReleaseRequest(int request_id);
 
@@ -59,6 +105,7 @@ class PagedKvCache {
   int CapacityPages() const { return page_pool_.capacity_pages(); }
   int ElementsPerToken() const;
   int ElementsPerPage() const;
+  bool HasKvStorage() const { return page_pool_.has_storage(); }
 
  private:
   PageDescriptor MakeFreeDescriptor(PageId page_id) const;

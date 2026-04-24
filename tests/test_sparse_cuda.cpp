@@ -5,6 +5,7 @@
 #include "dsd/config.h"
 #include "dsd/cuda_sparse_attention.h"
 #include "dsd/decode_pipeline.h"
+#include "dsd/paged_kv_cache.h"
 #include "dsd/reference_kernels.h"
 #include "dsd/synthetic_data.h"
 
@@ -41,7 +42,8 @@ bool RunSyntheticCase(const SparseCudaTestCase& test_case) {
       static_cast<int>(batch.requests.size()),
       total_candidates,
       total_selected_pages);
-  const auto sparse_cuda_batch = context.RunBatch(batch.requests);
+  const auto sparse_cuda_batch =
+      context.RunBatch(batch.requests, dsd::SparseBatchOutputMode::kDebugTensors);
 
   if (sparse_cuda_batch.per_request.size() != batch.requests.size()) {
     std::cerr << "sparse cuda batch returned wrong number of outputs\n";
@@ -97,7 +99,8 @@ bool RunZeroSelectionCase() {
       1,
       static_cast<int>(batch.requests.front().candidate_page_ids.size()),
       0);
-  const auto sparse_cuda_batch = context.RunBatch(batch.requests);
+  const auto sparse_cuda_batch =
+      context.RunBatch(batch.requests, dsd::SparseBatchOutputMode::kDebugTensors);
   const auto& sparse_cuda = sparse_cuda_batch.per_request.front();
 
   if (!sparse_cuda.selected_page_ids.empty()) {
@@ -111,6 +114,93 @@ bool RunZeroSelectionCase() {
     return false;
   }
 
+  return true;
+}
+
+bool RunTopKLargeCandidateCase() {
+  SparseCudaTestCase large_case;
+  large_case.config.num_heads = 2;
+  large_case.config.head_dim = 16;
+  large_case.config.page_size = 8;
+  large_case.config.top_k_pages = 8;
+  large_case.batch_size = 2;
+  large_case.min_context_tokens = 160;
+  large_case.max_context_tokens = 184;
+  large_case.seed = 123;
+  large_case.tolerance = 3e-5f;
+  return RunSyntheticCase(large_case);
+}
+
+bool RunTopKTieBreakCase() {
+  dsd::ModelConfig config;
+  config.num_heads = 1;
+  config.head_dim = 4;
+  config.page_size = 1;
+  config.top_k_pages = 2;
+  const int ept = config.num_heads * config.head_dim;
+  dsd::PagedKvCache cache(config, 4);
+  std::vector<dsd::PageId> page_ids;
+  for (int i = 0; i < 4; ++i) {
+    const std::vector<float> key(static_cast<std::size_t>(ept), 0.0f);
+    const std::vector<float> value(static_cast<std::size_t>(ept), static_cast<float>(i));
+    page_ids.push_back(cache.AppendPage(7, key, value, 1));
+  }
+
+  dsd::RequestState request;
+  request.request_id = 7;
+  request.query.assign(static_cast<std::size_t>(ept), 0.0f);
+  request.context_tokens = 4;
+  request.candidate_page_ids.assign(page_ids.begin(), page_ids.end());
+
+  dsd::SparseCudaContext context(cache, config, 1, 4, 2);
+  const auto result =
+      context.RunBatch(std::vector<dsd::RequestState>{request},
+                       dsd::SparseBatchOutputMode::kDebugTensors);
+  if (result.per_request.empty()) {
+    std::cerr << "tie-break case returned no output\n";
+    return false;
+  }
+  const std::vector<dsd::PageId> expected = {0, 1};
+  if (result.per_request.front().selected_page_ids != expected) {
+    std::cerr << "top-k tie-break should prefer smaller page ids\n";
+    return false;
+  }
+  return true;
+}
+
+bool RunNoOutputFastPathCase() {
+  dsd::ModelConfig config;
+  config.num_heads = 2;
+  config.head_dim = 16;
+  config.page_size = 8;
+  config.top_k_pages = 4;
+  const auto batch = dsd::BuildSyntheticBatch(config, 2, 32, 48, 88);
+  int total_candidates = 0;
+  int total_selected_pages = 0;
+  for (const auto& request : batch.requests) {
+    total_candidates += static_cast<int>(request.candidate_page_ids.size());
+    total_selected_pages += std::min(
+        config.top_k_pages,
+        static_cast<int>(request.candidate_page_ids.size()));
+  }
+  dsd::SparseCudaContext context(
+      batch.cache,
+      config,
+      static_cast<int>(batch.requests.size()),
+      total_candidates,
+      total_selected_pages);
+  dsd::SparseRunBatchOptions options;
+  options.output_mode = dsd::SparseBatchOutputMode::kNoOutputs;
+  options.timing_mode = dsd::SparseBatchTimingMode::kNone;
+  const auto result = context.RunBatch(batch.requests, options);
+  if (!result.per_request.empty()) {
+    std::cerr << "no-output fast path should not return per-request outputs\n";
+    return false;
+  }
+  if (result.aggregate_timings.total_ms != 0.0 || result.kernel_ms != 0.0) {
+    std::cerr << "timing-disabled fast path should leave kernel timings at zero\n";
+    return false;
+  }
   return true;
 }
 
@@ -167,6 +257,15 @@ int main() {
   }
 
   if (!RunZeroSelectionCase()) {
+    return 1;
+  }
+  if (!RunTopKLargeCandidateCase()) {
+    return 1;
+  }
+  if (!RunTopKTieBreakCase()) {
+    return 1;
+  }
+  if (!RunNoOutputFastPathCase()) {
     return 1;
   }
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <vector>
 
 namespace dsd {
@@ -44,6 +45,15 @@ struct RuntimeOverheadTimings {
   double time_kernel_launch_ms = 0.0;
   double time_sync_ms = 0.0;
   double time_prepare_sparse_layout_ms = 0.0;
+};
+
+struct DeviceTransferStats {
+  std::uint64_t h2d_bytes = 0;
+  std::uint64_t d2h_bytes = 0;
+  std::uint64_t h2d_calls = 0;
+  std::uint64_t d2h_calls = 0;
+  std::uint64_t h2d_large_calls = 0;
+  std::uint64_t d2h_large_calls = 0;
 };
 
 struct DenseBatchResult {

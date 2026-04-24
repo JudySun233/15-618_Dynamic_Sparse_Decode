@@ -16,6 +16,14 @@ namespace dsd {
 template <typename Fn>
 auto TimeHostMs(double* sink_ms, Fn&& fn) -> decltype(fn()) {
   using ReturnT = decltype(fn());
+  if (sink_ms == nullptr) {
+    if constexpr (std::is_void_v<ReturnT>) {
+      fn();
+      return;
+    } else {
+      return fn();
+    }
+  }
   using Clock = std::chrono::steady_clock;
   const auto start = Clock::now();
   if constexpr (std::is_void_v<ReturnT>) {
@@ -97,10 +105,10 @@ class DeviceArray {
     CopyFromHost(host.data(), host.size(), time_memcpy_h2d_ms);
   }
 
-  void CopyFromHost(
-      const T* host,
-      std::size_t count,
-      double* time_memcpy_h2d_ms = nullptr) {
+	  void CopyFromHost(
+	      const T* host,
+	      std::size_t count,
+	      double* time_memcpy_h2d_ms = nullptr) {
     if (count > count_) {
       throw std::invalid_argument("device array size mismatch");
     }
@@ -113,8 +121,29 @@ class DeviceArray {
           host,
           count * sizeof(T),
           cudaMemcpyHostToDevice));
-    });
-  }
+	    });
+	  }
+
+	  void CopyFromHostAsync(
+	      const T* host,
+	      std::size_t count,
+	      cudaStream_t stream,
+	      double* time_memcpy_h2d_ms = nullptr) {
+	    if (count > count_) {
+	      throw std::invalid_argument("device array size mismatch");
+	    }
+	    if (count == 0 || count_ == 0) {
+	      return;
+	    }
+	    TimeHostMs(time_memcpy_h2d_ms, [&]() {
+	      DSD_CUDA_CHECK(cudaMemcpyAsync(
+	          ptr_,
+	          host,
+	          count * sizeof(T),
+	          cudaMemcpyHostToDevice,
+	          stream));
+	    });
+	  }
 
   void CopyToHost(std::vector<T>* host, double* time_memcpy_d2h_ms = nullptr) const {
     if (host == nullptr) {
@@ -123,10 +152,10 @@ class DeviceArray {
     CopyToHost(host, count_, time_memcpy_d2h_ms);
   }
 
-  void CopyToHost(
-      std::vector<T>* host,
-      std::size_t count,
-      double* time_memcpy_d2h_ms = nullptr) const {
+	  void CopyToHost(
+	      std::vector<T>* host,
+	      std::size_t count,
+	      double* time_memcpy_d2h_ms = nullptr) const {
     if (count > count_) {
       throw std::invalid_argument("device array size mismatch");
     }
@@ -140,8 +169,50 @@ class DeviceArray {
           ptr_,
           count * sizeof(T),
           cudaMemcpyDeviceToHost));
-    });
-  }
+	    });
+	  }
+
+	  void CopyToHostAsync(
+	      std::vector<T>* host,
+	      std::size_t count,
+	      cudaStream_t stream,
+	      double* time_memcpy_d2h_ms = nullptr) const {
+	    if (count > count_) {
+	      throw std::invalid_argument("device array size mismatch");
+	    }
+	    if (host == nullptr) {
+	      throw std::invalid_argument("host output pointer is null");
+	    }
+	    host->resize(count);
+	    if (count == 0 || count_ == 0) {
+	      return;
+	    }
+	    TimeHostMs(time_memcpy_d2h_ms, [&]() {
+	      DSD_CUDA_CHECK(cudaMemcpyAsync(
+	          host->data(),
+	          ptr_,
+	          count * sizeof(T),
+	          cudaMemcpyDeviceToHost,
+	          stream));
+	      DSD_CUDA_CHECK(cudaStreamSynchronize(stream));
+	    });
+	  }
+
+	  void MemsetAsync(
+	      int value,
+	      std::size_t count,
+	      cudaStream_t stream,
+	      double* time_memset_ms = nullptr) {
+	    if (count > count_) {
+	      throw std::invalid_argument("device array size mismatch");
+	    }
+	    if (count == 0 || count_ == 0) {
+	      return;
+	    }
+	    TimeHostMs(time_memset_ms, [&]() {
+	      DSD_CUDA_CHECK(cudaMemsetAsync(ptr_, value, count * sizeof(T), stream));
+	    });
+	  }
 
   T* get() { return ptr_; }
   const T* get() const { return ptr_; }

@@ -26,9 +26,25 @@ void DenseCudaContext::SyncPageFromCache(const PagedKvCache&, PageId) {
       "reconfigure the project with CUDA enabled.");
 }
 
+void DenseCudaContext::SyncPagesFromCache(
+    const PagedKvCache&,
+    const std::vector<PageId>&) {
+  throw std::runtime_error(
+      "Dense CUDA attention backend is unavailable. Load a CUDA toolkit and "
+      "reconfigure the project with CUDA enabled.");
+}
+
 void DenseCudaContext::SyncAppendedToken(
     const PagedKvCache&,
     const AppendTokenResult&) {
+  throw std::runtime_error(
+      "Dense CUDA attention backend is unavailable. Load a CUDA toolkit and "
+      "reconfigure the project with CUDA enabled.");
+}
+
+void DenseCudaContext::SyncAppendedTokens(
+    const PagedKvCache&,
+    const std::vector<AppendTokenResult>&) {
   throw std::runtime_error(
       "Dense CUDA attention backend is unavailable. Load a CUDA toolkit and "
       "reconfigure the project with CUDA enabled.");
