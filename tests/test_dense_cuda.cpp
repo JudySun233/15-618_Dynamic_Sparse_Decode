@@ -26,7 +26,8 @@ bool RunSyntheticCase(const DenseCudaTestCase& test_case) {
       test_case.max_context_tokens,
       test_case.seed);
   dsd::DecodePipeline pipeline(test_case.config);
-  const auto dense_cuda = pipeline.RunDenseBatchCuda(batch.cache, batch.requests);
+  dsd::DenseCudaContext context(batch.cache, test_case.config);
+  const auto dense_cuda = context.RunBatch(batch.requests);
 
   if (dense_cuda.outputs.size() != batch.requests.size()) {
     std::cerr << "dense cuda batch returned the wrong number of outputs\n";
@@ -69,7 +70,8 @@ bool RunZeroContextCase() {
 
   dsd::DecodePipeline pipeline(config);
   const auto dense_cpu = pipeline.RunDenseStep(cache, request);
-  const auto dense_cuda = pipeline.RunDenseBatchCuda(cache, {request});
+  dsd::DenseCudaContext context(cache, config);
+  const auto dense_cuda = context.RunBatch({request});
   if (dense_cuda.outputs.size() != 1) {
     std::cerr << "zero-context cuda batch returned wrong output count\n";
     return false;

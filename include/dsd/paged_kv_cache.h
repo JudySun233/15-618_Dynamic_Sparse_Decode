@@ -29,6 +29,13 @@ class PagedKvCache {
       const std::vector<float>& values,
       int token_count);
 
+  AppendTokenResult AppendToken(
+      int request_id,
+      const std::vector<float>& key,
+      const std::vector<float>& value);
+
+  std::vector<PageId> ReleaseRequest(int request_id);
+
   void Reset();
 
   const PageDescriptor& GetPage(PageId page_id) const;
@@ -36,9 +43,16 @@ class PagedKvCache {
   const std::vector<PageDescriptor>& Pages() const { return pages_; }
   const std::vector<float>& KeyPool() const { return page_pool_.key_storage(); }
   const std::vector<float>& ValuePool() const { return page_pool_.value_storage(); }
+  const std::vector<float>& PageSummaryPool() const { return page_summary_pool_; }
 
   std::vector<float> CopyPageKeys(PageId page_id) const;
   std::vector<float> CopyPageValues(PageId page_id) const;
+  void CopyPageToken(
+      PageId page_id,
+      int token_offset,
+      std::vector<float>* key,
+      std::vector<float>* value) const;
+  std::vector<float> CopyPageSummary(PageId page_id) const;
   std::vector<float> BuildPageSummary(PageId page_id) const;
 
   int TotalPages() const;
@@ -48,10 +62,14 @@ class PagedKvCache {
 
  private:
   PageDescriptor MakeFreeDescriptor(PageId page_id) const;
+  int NextStartTokenForRequest(int request_id) const;
+  float* MutablePageSummary(PageId page_id);
+  const float* PageSummary(PageId page_id) const;
 
   ModelConfig config_;
   PagePool page_pool_;
   std::vector<PageDescriptor> pages_;
+  std::vector<float> page_summary_pool_;
   std::unordered_map<int, std::vector<PageId>> request_to_pages_;
   int active_page_count_ = 0;
 };

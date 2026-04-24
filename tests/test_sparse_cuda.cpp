@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <iostream>
 #include <vector>
 
@@ -26,11 +27,35 @@ bool RunSyntheticCase(const SparseCudaTestCase& test_case) {
       test_case.max_context_tokens,
       test_case.seed);
   dsd::DecodePipeline pipeline(test_case.config);
+  int total_candidates = 0;
+  int total_selected_pages = 0;
+  for (const auto& request : batch.requests) {
+    total_candidates += static_cast<int>(request.candidate_page_ids.size());
+    total_selected_pages += std::min(
+        test_case.config.top_k_pages,
+        static_cast<int>(request.candidate_page_ids.size()));
+  }
+  dsd::SparseCudaContext context(
+      batch.cache,
+      test_case.config,
+      static_cast<int>(batch.requests.size()),
+      total_candidates,
+      total_selected_pages);
+  const auto sparse_cuda_batch = context.RunBatch(batch.requests);
+
+  if (sparse_cuda_batch.per_request.size() != batch.requests.size()) {
+    std::cerr << "sparse cuda batch returned wrong number of outputs\n";
+    return false;
+  }
+
+  if (sparse_cuda_batch.aggregate_timings.gather_ms != 0.0) {
+    std::cerr << "batched sparse gather stage should be fused into attention\n";
+    return false;
+  }
 
   for (std::size_t i = 0; i < batch.requests.size(); ++i) {
     const auto sparse_cpu = pipeline.RunNaiveSparseStep(batch.cache, batch.requests[i]);
-    const auto sparse_cuda =
-        pipeline.RunNaiveSparseStepCuda(batch.cache, batch.requests[i]);
+    const auto& sparse_cuda = sparse_cuda_batch.per_request[i];
 
     if (sparse_cpu.selected_page_ids != sparse_cuda.selected_page_ids) {
       std::cerr << "sparse cuda selected a different page set for request " << i << "\n";
@@ -66,7 +91,14 @@ bool RunZeroSelectionCase() {
   const auto batch = dsd::BuildSyntheticBatch(config, 1, 9, 9, 41);
   dsd::DecodePipeline pipeline(config);
   const auto sparse_cpu = pipeline.RunNaiveSparseStep(batch.cache, batch.requests.front());
-  const auto sparse_cuda = pipeline.RunNaiveSparseStepCuda(batch.cache, batch.requests.front());
+  dsd::SparseCudaContext context(
+      batch.cache,
+      config,
+      1,
+      static_cast<int>(batch.requests.front().candidate_page_ids.size()),
+      0);
+  const auto sparse_cuda_batch = context.RunBatch(batch.requests);
+  const auto& sparse_cuda = sparse_cuda_batch.per_request.front();
 
   if (!sparse_cuda.selected_page_ids.empty()) {
     std::cerr << "zero-selection sparse cuda path should not select pages\n";

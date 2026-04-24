@@ -6,6 +6,12 @@ namespace dsd {
 
 using PageId = int;
 
+struct AppendTokenResult {
+  PageId page_id = -1;
+  int token_offset = 0;
+  bool allocated_new_page = false;
+};
+
 struct RequestState {
   int request_id = -1;
   std::vector<float> query;
@@ -66,6 +72,13 @@ struct SparseDecodeResult {
 struct BatchDecodeResult {
   std::vector<SparseDecodeResult> per_request;
   StageTimings aggregate_timings;
+};
+
+struct SparseBatchCudaResult {
+  std::vector<SparseDecodeResult> per_request;
+  StageTimings aggregate_timings;
+  RuntimeOverheadTimings runtime_overheads;
+  double kernel_ms = 0.0;
 };
 
 }  // namespace dsd

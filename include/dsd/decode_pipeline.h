@@ -3,6 +3,8 @@
 #include <vector>
 
 #include "dsd/config.h"
+#include "dsd/cuda_dense_attention.h"
+#include "dsd/cuda_sparse_attention.h"
 #include "dsd/paged_kv_cache.h"
 #include "dsd/reference_kernels.h"
 #include "dsd/types.h"
@@ -31,6 +33,14 @@ class DecodePipeline {
 
   DenseBatchResult RunDenseBatchCuda(
       const PagedKvCache& cache,
+      const std::vector<RequestState>& requests) const;
+
+  DenseBatchResult RunDenseBatchCuda(
+      DenseCudaContext& context,
+      const std::vector<RequestState>& requests) const;
+
+  SparseBatchCudaResult RunNaiveSparseBatchCuda(
+      SparseCudaContext& context,
       const std::vector<RequestState>& requests) const;
 
   BatchDecodeResult RunNaiveSparseBatch(

@@ -1,7 +1,10 @@
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -59,6 +62,18 @@ struct DenseGpuStats {
   double gpu_kernel_ms = 0.0;
   dsd::RuntimeOverheadTimings runtime_overheads;
   std::vector<dsd::AttentionResult> outputs;
+};
+
+struct AnalyticalStats {
+  std::uint64_t total_context_tokens = 0;
+  std::uint64_t total_candidate_pages = 0;
+  std::uint64_t total_selected_tokens = 0;
+  std::uint64_t dense_bytes = 0;
+  std::uint64_t sparse_current_bytes = 0;
+  std::uint64_t sparse_target_bytes = 0;
+  double dense_flops = 0.0;
+  double sparse_current_flops = 0.0;
+  double sparse_target_flops = 0.0;
 };
 
 void AccumulateRuntimeOverheads(
@@ -126,8 +141,7 @@ DenseCpuStats RunDenseCpu(
 }
 
 SparseGpuStats RunSparseGpu(
-    dsd::DecodePipeline* pipeline,
-    const dsd::PagedKvCache& cache,
+    dsd::SparseCudaContext* context,
     const std::vector<dsd::RequestState>& requests) {
   SparseGpuStats stats;
   stats.available = dsd::SparseAttentionCudaAvailable();
@@ -135,26 +149,22 @@ SparseGpuStats RunSparseGpu(
     return stats;
   }
 
-  stats.outputs.reserve(requests.size());
   const auto total_start = Clock::now();
-  for (const auto& request : requests) {
-    auto result = pipeline->RunNaiveSparseStepCuda(cache, request);
-    stats.score_ms += result.timings.page_scoring_ms;
-    stats.topk_ms += result.timings.topk_ms;
-    stats.gather_ms += result.timings.gather_ms;
-    stats.attention_ms += result.timings.attention_ms;
-    stats.gpu_kernel_ms += result.timings.gather_ms + result.timings.attention_ms;
-    AccumulateRuntimeOverheads(&stats.runtime_overheads, result.runtime_overheads);
-    stats.outputs.push_back(std::move(result));
-  }
+  const auto batch = context->RunBatch(requests);
   const auto total_end = Clock::now();
   stats.total_ms = std::chrono::duration<double, std::milli>(total_end - total_start).count();
+  stats.score_ms = batch.aggregate_timings.page_scoring_ms;
+  stats.topk_ms = batch.aggregate_timings.topk_ms;
+  stats.gather_ms = batch.aggregate_timings.gather_ms;
+  stats.attention_ms = batch.aggregate_timings.attention_ms;
+  stats.gpu_kernel_ms = batch.kernel_ms;
+  stats.runtime_overheads = batch.runtime_overheads;
+  stats.outputs = batch.per_request;
   return stats;
 }
 
 DenseGpuStats RunDenseGpu(
-    dsd::DecodePipeline* pipeline,
-    const dsd::PagedKvCache& cache,
+    dsd::DenseCudaContext* context,
     const std::vector<dsd::RequestState>& requests) {
   DenseGpuStats stats;
   stats.available = dsd::DenseAttentionCudaAvailable();
@@ -163,7 +173,7 @@ DenseGpuStats RunDenseGpu(
   }
 
   const auto total_start = Clock::now();
-  const auto batch = pipeline->RunDenseBatchCuda(cache, requests);
+  const auto batch = context->RunBatch(requests);
   const auto total_end = Clock::now();
   stats.total_ms = std::chrono::duration<double, std::milli>(total_end - total_start).count();
   stats.attention_ms = batch.kernel_ms;
@@ -171,6 +181,67 @@ DenseGpuStats RunDenseGpu(
   stats.runtime_overheads = batch.runtime_overheads;
   stats.outputs = batch.outputs;
   return stats;
+}
+
+AnalyticalStats ComputeAnalyticalStats(
+    const dsd::ModelConfig& config,
+    const std::vector<dsd::RequestState>& requests) {
+  AnalyticalStats stats;
+  const std::uint64_t elements_per_token =
+      static_cast<std::uint64_t>(config.num_heads * config.head_dim);
+  const std::uint64_t bytes_per_token = elements_per_token * sizeof(float);
+
+  for (const auto& request : requests) {
+    const std::uint64_t context_tokens =
+        static_cast<std::uint64_t>(std::max(0, request.context_tokens));
+    const std::uint64_t candidate_pages =
+        static_cast<std::uint64_t>(request.candidate_page_ids.size());
+    const std::uint64_t selected_pages =
+        static_cast<std::uint64_t>(
+            std::min<int>(config.top_k_pages, request.candidate_page_ids.size()));
+    stats.total_context_tokens += context_tokens;
+    stats.total_candidate_pages += candidate_pages;
+    stats.total_selected_tokens +=
+        selected_pages * static_cast<std::uint64_t>(config.page_size);
+  }
+
+  stats.dense_bytes = 2 * stats.total_context_tokens * bytes_per_token;
+  stats.sparse_current_bytes =
+      (stats.total_context_tokens + 6 * stats.total_selected_tokens) * bytes_per_token;
+  stats.sparse_target_bytes =
+      (stats.total_candidate_pages + 2 * stats.total_selected_tokens) * bytes_per_token;
+
+  stats.dense_flops =
+      static_cast<double>(4 * stats.total_context_tokens * elements_per_token);
+  stats.sparse_current_flops =
+      static_cast<double>(
+          2 * stats.total_candidate_pages * elements_per_token +
+          4 * stats.total_selected_tokens * elements_per_token);
+  stats.sparse_target_flops =
+      static_cast<double>(
+          2 * stats.total_candidate_pages * elements_per_token +
+          4 * stats.total_selected_tokens * elements_per_token);
+  return stats;
+}
+
+void PrintAnalyticalRow(
+    const std::string& path,
+    std::uint64_t bytes,
+    double flops,
+    double peak_bw_bytes_per_s,
+    double peak_fp32_flops_per_s) {
+  const double ai = bytes > 0 ? (flops / static_cast<double>(bytes)) : 0.0;
+  const double bw_floor_us =
+      peak_bw_bytes_per_s > 0.0 ? (static_cast<double>(bytes) / peak_bw_bytes_per_s) * 1e6 : 0.0;
+  const double compute_floor_us =
+      peak_fp32_flops_per_s > 0.0 ? (flops / peak_fp32_flops_per_s) * 1e6 : 0.0;
+  std::cout << std::left << std::setw(16) << path
+            << std::right << std::setw(12) << std::fixed << std::setprecision(3)
+            << (static_cast<double>(bytes) / 1.0e6)
+            << std::setw(12) << (flops / 1.0e6)
+            << std::setw(12) << ai
+            << std::setw(14) << bw_floor_us
+            << std::setw(14) << compute_floor_us << "\n";
 }
 
 template <typename T>
@@ -264,10 +335,10 @@ void PrintRuntimeOverheadRow(
 
 int main(int argc, char** argv) {
   dsd::ModelConfig config;
-  config.num_heads = 8;
-  config.head_dim = 16;
-  config.page_size = 16;
   config.top_k_pages = ReadArgOrDefault(argc, argv, 1, 8);
+  config.num_heads = ReadArgOrDefault(argc, argv, 8, 8);
+  config.head_dim = ReadArgOrDefault(argc, argv, 9, 16);
+  config.page_size = ReadArgOrDefault(argc, argv, 10, 16);
 
   const int batch_size = ReadArgOrDefault(argc, argv, 2, 16);
   const int min_context_tokens = ReadArgOrDefault(argc, argv, 3, 512);
@@ -279,15 +350,38 @@ int main(int argc, char** argv) {
   const auto batch = dsd::BuildSyntheticBatch(
       config, batch_size, min_context_tokens, max_context_tokens, seed);
   dsd::DecodePipeline pipeline(config);
+  const auto analytical = ComputeAnalyticalStats(config, batch.requests);
+
+  std::unique_ptr<dsd::DenseCudaContext> dense_context;
+  if (dsd::DenseAttentionCudaAvailable()) {
+    dense_context = std::make_unique<dsd::DenseCudaContext>(batch.cache, config);
+  }
+
+  int total_candidates = 0;
+  int total_selected_pages = 0;
+  for (const auto& request : batch.requests) {
+    total_candidates += static_cast<int>(request.candidate_page_ids.size());
+    total_selected_pages +=
+        std::min(config.top_k_pages, static_cast<int>(request.candidate_page_ids.size()));
+  }
+  std::unique_ptr<dsd::SparseCudaContext> sparse_context;
+  if (dsd::SparseAttentionCudaAvailable()) {
+    sparse_context = std::make_unique<dsd::SparseCudaContext>(
+        batch.cache,
+        config,
+        batch_size,
+        total_candidates,
+        total_selected_pages);
+  }
 
   for (int i = 0; i < warmup; ++i) {
     (void)RunDenseCpu(&pipeline, batch.cache, batch.requests);
     (void)RunSparseCpu(&pipeline, batch.cache, batch.requests);
     if (dsd::DenseAttentionCudaAvailable()) {
-      (void)RunDenseGpu(&pipeline, batch.cache, batch.requests);
+      (void)RunDenseGpu(dense_context.get(), batch.requests);
     }
     if (dsd::SparseAttentionCudaAvailable()) {
-      (void)RunSparseGpu(&pipeline, batch.cache, batch.requests);
+      (void)RunSparseGpu(sparse_context.get(), batch.requests);
     }
   }
 
@@ -336,7 +430,7 @@ int main(int argc, char** argv) {
     AccumulateRuntimeOverheads(&sparse_cpu_runtime_overheads, sparse_cpu_last.runtime_overheads);
 
     if (dsd::DenseAttentionCudaAvailable()) {
-      dense_gpu_last = RunDenseGpu(&pipeline, batch.cache, batch.requests);
+      dense_gpu_last = RunDenseGpu(dense_context.get(), batch.requests);
       dense_gpu_total_ms += dense_gpu_last.total_ms;
       dense_gpu_attention_ms += dense_gpu_last.attention_ms;
       dense_gpu_kernel_ms += dense_gpu_last.gpu_kernel_ms;
@@ -344,7 +438,7 @@ int main(int argc, char** argv) {
     }
 
     if (dsd::SparseAttentionCudaAvailable()) {
-      sparse_gpu_last = RunSparseGpu(&pipeline, batch.cache, batch.requests);
+      sparse_gpu_last = RunSparseGpu(sparse_context.get(), batch.requests);
       sparse_gpu_total_ms += sparse_gpu_last.total_ms;
       sparse_gpu_score_ms += sparse_gpu_last.score_ms;
       sparse_gpu_topk_ms += sparse_gpu_last.topk_ms;
@@ -398,11 +492,58 @@ int main(int argc, char** argv) {
   std::cout << "batch_size=" << batch_size
             << " total_pages=" << batch.cache.TotalPages()
             << " top_k_pages=" << config.top_k_pages
+            << " num_heads=" << config.num_heads
+            << " head_dim=" << config.head_dim
+            << " page_size=" << config.page_size
             << " min_ctx=" << min_context_tokens
             << " max_ctx=" << max_context_tokens
             << " seed=" << seed
             << " iterations=" << iterations
             << " warmup=" << warmup << "\n";
+
+  constexpr double kH100PeakBandwidthBytesPerSec = 3.35e12;
+  constexpr double kH100PeakFp32FlopsPerSec = 67.0e12;
+  std::cout << "\n== Analytical Ceiling ==\n";
+  std::cout << "total_context_tokens=" << analytical.total_context_tokens
+            << " total_candidate_pages=" << analytical.total_candidate_pages
+            << " total_selected_tokens=" << analytical.total_selected_tokens << "\n";
+  std::cout << std::left << std::setw(16) << "Path"
+            << std::right << std::setw(12) << "Bytes(MB)"
+            << std::setw(12) << "FLOPs(M)"
+            << std::setw(12) << "AI"
+            << std::setw(14) << "BwFloor(us)"
+            << std::setw(14) << "CmpFloor(us)" << "\n";
+  std::cout << std::string(80, '-') << "\n";
+  PrintAnalyticalRow(
+      "dense",
+      analytical.dense_bytes,
+      analytical.dense_flops,
+      kH100PeakBandwidthBytesPerSec,
+      kH100PeakFp32FlopsPerSec);
+  PrintAnalyticalRow(
+      "sparse_current",
+      analytical.sparse_current_bytes,
+      analytical.sparse_current_flops,
+      kH100PeakBandwidthBytesPerSec,
+      kH100PeakFp32FlopsPerSec);
+  PrintAnalyticalRow(
+      "sparse_target",
+      analytical.sparse_target_bytes,
+      analytical.sparse_target_flops,
+      kH100PeakBandwidthBytesPerSec,
+      kH100PeakFp32FlopsPerSec);
+  std::cout << "sparse_current_over_dense_bytes="
+            << std::fixed << std::setprecision(3)
+            << (analytical.dense_bytes > 0
+                    ? static_cast<double>(analytical.sparse_current_bytes) /
+                          static_cast<double>(analytical.dense_bytes)
+                    : 0.0)
+            << " sparse_target_over_dense_bytes="
+            << (analytical.dense_bytes > 0
+                    ? static_cast<double>(analytical.sparse_target_bytes) /
+                          static_cast<double>(analytical.dense_bytes)
+                    : 0.0)
+            << "\n";
 
   std::cout << "\n== End-to-End ==\n";
   std::cout << std::left << std::setw(12) << "Path"
@@ -423,7 +564,7 @@ int main(int argc, char** argv) {
       sparse_gpu_total_ms,
       dense_cpu_total_ms,
       dsd::SparseAttentionCudaAvailable(),
-      dsd::SparseAttentionCudaAvailable() ? "per-request GPU path" : "unavailable");
+      dsd::SparseAttentionCudaAvailable() ? "batched sparse GPU path" : "unavailable");
 
   std::cout << "\n== Stage / Kernel Breakdown ==\n";
   std::cout << std::left << std::setw(12) << "Path"
@@ -461,7 +602,7 @@ int main(int argc, char** argv) {
       sparse_gpu_gather_ms,
       sparse_gpu_attention_ms,
       sparse_gpu_kernel_ms,
-      dsd::SparseAttentionCudaAvailable() ? "GPU score/top-k + gather/attend" : "unavailable");
+      dsd::SparseAttentionCudaAvailable() ? "GPU score/top-k + fused attend" : "unavailable");
 
   std::cout << "\n== Runtime Overheads ==\n";
   std::cout << std::left << std::setw(12) << "Path"
@@ -508,7 +649,8 @@ int main(int argc, char** argv) {
   std::cout << "Speedup is dense_cpu_total_ms / path_total_ms.\n";
   std::cout << "Stage / Kernel Breakdown shows compute-stage timings only.\n";
   std::cout << "Runtime Overheads breaks out malloc/memcpy/free, kernel launch, sync, and sparse metadata preparation.\n";
-  std::cout << "For sparse_gpu, Score/TopK/Gather/Attend all run through the sparse CUDA path; sparse layout prep still includes host-side metadata work.\n";
+  std::cout << "Analytical Ceiling reports byte/flop lower bounds against H100 peak bandwidth and FP32 throughput.\n";
+  std::cout << "For sparse_gpu, Gather is fused into attention in the fast path, so gather_ms is expected to be zero.\n";
   std::cout << "For dense_gpu, Attend and GPUKernel are both the measured CUDA dense-attention kernel time.\n";
 
   return 0;

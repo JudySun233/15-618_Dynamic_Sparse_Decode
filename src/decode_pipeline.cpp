@@ -74,6 +74,18 @@ DenseBatchResult DecodePipeline::RunDenseBatchCuda(
   return DenseAttentionCudaBatch(cache, requests, config_);
 }
 
+DenseBatchResult DecodePipeline::RunDenseBatchCuda(
+    DenseCudaContext& context,
+    const std::vector<RequestState>& requests) const {
+  return context.RunBatch(requests);
+}
+
+SparseBatchCudaResult DecodePipeline::RunNaiveSparseBatchCuda(
+    SparseCudaContext& context,
+    const std::vector<RequestState>& requests) const {
+  return context.RunBatch(requests);
+}
+
 BatchDecodeResult DecodePipeline::RunNaiveSparseBatch(
     const PagedKvCache& cache,
     const std::vector<RequestState>& requests) const {
