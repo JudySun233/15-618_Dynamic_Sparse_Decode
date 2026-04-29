@@ -11,6 +11,7 @@
 #include <unordered_set>
 #include <utility>
 
+#include "dsd/cuda_dense_attention.h"
 #include "dsd/paged_kv_cache.h"
 #include "dsd/reference_kernels.h"
 
@@ -250,6 +251,19 @@ void BuildRequestPointerBatch(
   }
 }
 
+void BuildRequestBatch(
+    const std::vector<ActiveDecodeRequest>& active,
+    std::vector<RequestState>* requests) {
+  if (requests == nullptr) {
+    throw std::invalid_argument("request batch output must be non-null");
+  }
+  requests->clear();
+  requests->reserve(active.size());
+  for (const auto& request : active) {
+    requests->push_back(request.state);
+  }
+}
+
 void RefreshRequestPages(PagedKvCache* cache, ActiveDecodeRequest* active) {
   const auto& pages = cache->GetRequestPages(active->state.request_id);
   active->state.candidate_page_ids.assign(pages.begin(), pages.end());
@@ -402,8 +416,14 @@ ContinuousBatchStats RunContinuousSparseDecode(
     }
   }
 
-  const int capacity_pages = RequiredCapacityPages(config, request_specs);
+  const int total_required_pages = RequiredCapacityPages(config, request_specs);
   const int max_pages_per_request = MaxPagesPerRequest(config, request_specs);
+  const int active_window_pages =
+      std::max(1, options.max_active_requests * max_pages_per_request);
+  const int capacity_pages =
+      options.preadmit_prompts
+          ? total_required_pages
+          : std::min(total_required_pages, active_window_pages);
   const int max_total_candidates =
       options.max_active_requests * max_pages_per_request;
   const int max_total_selected_pages =
@@ -461,6 +481,9 @@ ContinuousBatchStats RunContinuousSparseDecode(
       stats.admission_ms +=
           std::chrono::duration<double, std::milli>(
               admission_end - admission_start).count();
+      stats.prompt_preadmit_ms +=
+          std::chrono::duration<double, std::milli>(
+              admission_end - admission_start).count();
       admitted[spec_idx] = static_cast<std::uint8_t>(1);
     }
     stats.admission_device_transfer_stats = sparse_context.DeviceTransfers();
@@ -500,6 +523,9 @@ ContinuousBatchStats RunContinuousSparseDecode(
             &sparse_context);
         const auto admission_end = Clock::now();
         stats.admission_ms +=
+            std::chrono::duration<double, std::milli>(
+                admission_end - admission_start).count();
+        stats.runtime_admission_ms +=
             std::chrono::duration<double, std::milli>(
                 admission_end - admission_start).count();
         admitted[spec_idx] = static_cast<std::uint8_t>(1);
@@ -681,7 +707,289 @@ ContinuousBatchStats RunContinuousSparseDecode(
   if (stats.outside_run_batch_ms < 0.0) {
     stats.outside_run_batch_ms = 0.0;
   }
+  stats.serving_loop_other_ms =
+      stats.total_wall_ms - stats.run_batch_wall_ms -
+      stats.runtime_admission_ms - stats.append_sync_ms -
+      stats.release_sync_ms;
+  if (stats.serving_loop_other_ms < 0.0) {
+    stats.serving_loop_other_ms = 0.0;
+  }
+  stats.measured_end_to_end_ms =
+      stats.decode_payload_prep_ms + stats.prompt_preadmit_ms +
+      stats.total_wall_ms;
   Accumulate(&stats.device_transfer_stats, sparse_context.DeviceTransfers());
+  stats.avg_step_ms =
+      step_ms_values.empty()
+          ? 0.0
+          : std::accumulate(step_ms_values.begin(), step_ms_values.end(), 0.0) /
+                static_cast<double>(step_ms_values.size());
+  stats.p50_step_ms = Percentile(step_ms_values, 0.50);
+  stats.p95_step_ms = Percentile(step_ms_values, 0.95);
+  stats.avg_active_batch_size =
+      nonempty_steps > 0
+          ? static_cast<double>(active_batch_size_sum) / static_cast<double>(nonempty_steps)
+          : 0.0;
+  if (nonempty_steps > 0) {
+    const double inv_steps = 1.0 / static_cast<double>(nonempty_steps);
+    stats.avg_sparse_timings = total_timings;
+    Scale(&stats.avg_sparse_timings, inv_steps);
+    stats.avg_runtime_overheads = total_overheads;
+    Scale(&stats.avg_runtime_overheads, inv_steps);
+  }
+
+  return stats;
+}
+
+ContinuousBatchStats RunContinuousDenseGpuDecode(
+    const ModelConfig& config,
+    const std::vector<ContinuousRequestSpec>& request_specs,
+    int max_active_requests) {
+  ContinuousDecodeOptions options;
+  options.max_active_requests = max_active_requests;
+  return RunContinuousDenseGpuDecode(config, request_specs, options);
+}
+
+ContinuousBatchStats RunContinuousDenseGpuDecode(
+    const ModelConfig& config,
+    const std::vector<ContinuousRequestSpec>& request_specs,
+    const ContinuousDecodeOptions& options) {
+  if (options.max_active_requests <= 0) {
+    throw std::invalid_argument("max_active_requests must be positive");
+  }
+  if (!DenseAttentionCudaAvailable()) {
+    throw std::runtime_error("continuous dense GPU decode requires a visible CUDA GPU");
+  }
+
+  for (const auto& request : request_specs) {
+    ValidateRequestSpec(config, request);
+  }
+  std::unordered_set<int> request_ids;
+  request_ids.reserve(request_specs.size());
+  for (const auto& request : request_specs) {
+    if (!request_ids.insert(request.request_id).second) {
+      throw std::invalid_argument("continuous workload request_id values must be unique");
+    }
+  }
+
+  const int capacity_pages = RequiredCapacityPages(config, request_specs);
+  PagedKvCache cache(config, capacity_pages, true);
+  DenseCudaContext dense_context(cache, config);
+
+  ContinuousBatchStats stats;
+  DecodePayloadStore decode_payloads;
+  if (options.precompute_decode_payloads) {
+    const auto prep_start = Clock::now();
+    decode_payloads = BuildDecodePayloadStore(config, request_specs, true);
+    const auto prep_end = Clock::now();
+    stats.decode_payload_prep_ms =
+        std::chrono::duration<double, std::milli>(prep_end - prep_start).count();
+  }
+
+  std::vector<double> step_ms_values;
+  StageTimings total_timings;
+  RuntimeOverheadTimings total_overheads;
+  int nonempty_steps = 0;
+  int active_batch_size_sum = 0;
+
+  std::deque<std::size_t> pending_indices;
+  std::vector<ActiveDecodeRequest> active;
+  active.reserve(static_cast<std::size_t>(options.max_active_requests));
+  std::vector<RequestState> batch_requests;
+  batch_requests.reserve(static_cast<std::size_t>(options.max_active_requests));
+  std::vector<std::uint8_t> admitted(
+      request_specs.size(),
+      static_cast<std::uint8_t>(0));
+
+  if (options.preadmit_prompts) {
+    for (std::size_t spec_idx = 0; spec_idx < request_specs.size(); ++spec_idx) {
+      const auto admission_start = Clock::now();
+      const auto admitted_pages = AdmitRequest(config, request_specs[spec_idx], &cache);
+      dense_context.SyncPagesFromCache(cache, admitted_pages);
+      const auto admission_end = Clock::now();
+      const double admission_ms =
+          std::chrono::duration<double, std::milli>(
+              admission_end - admission_start).count();
+      stats.admission_ms += admission_ms;
+      stats.prompt_preadmit_ms += admission_ms;
+      admitted[spec_idx] = static_cast<std::uint8_t>(1);
+    }
+  }
+
+  std::size_t next_arrival = 0;
+  int step = 0;
+  const auto wall_start = Clock::now();
+
+  while (next_arrival < request_specs.size() || !pending_indices.empty() ||
+         !active.empty()) {
+    if (active.empty() && pending_indices.empty() &&
+        next_arrival < request_specs.size() &&
+        step < request_specs[next_arrival].arrival_step) {
+      step = request_specs[next_arrival].arrival_step;
+    }
+
+    while (next_arrival < request_specs.size() &&
+           request_specs[next_arrival].arrival_step <= step) {
+      pending_indices.push_back(next_arrival);
+      ++next_arrival;
+    }
+
+    while (static_cast<int>(active.size()) < options.max_active_requests &&
+           !pending_indices.empty()) {
+      const auto spec_idx = pending_indices.front();
+      pending_indices.pop_front();
+      const auto& spec = request_specs[spec_idx];
+      if (admitted[spec_idx] == 0) {
+        const auto admission_start = Clock::now();
+        const auto admitted_pages = AdmitRequest(config, spec, &cache);
+        dense_context.SyncPagesFromCache(cache, admitted_pages);
+        const auto admission_end = Clock::now();
+        const double admission_ms =
+            std::chrono::duration<double, std::milli>(
+                admission_end - admission_start).count();
+        stats.admission_ms += admission_ms;
+        stats.runtime_admission_ms += admission_ms;
+        admitted[spec_idx] = static_cast<std::uint8_t>(1);
+      }
+      if (spec.decode_steps > 0) {
+        ActiveDecodeRequest active_request;
+        active_request.state = MakeRequestState(
+            spec.request_id, spec.initial_query, cache, spec.prompt_tokens);
+        active_request.remaining_decode_steps = spec.decode_steps;
+        active_request.decode_step_index = 0;
+        active_request.spec_index = spec_idx;
+        active.push_back(std::move(active_request));
+      } else {
+        const auto released_pages = cache.ReleaseRequest(spec.request_id);
+        if (!options.lazy_release) {
+          dense_context.SyncFreedPages(released_pages);
+        }
+      }
+    }
+
+    if (active.empty()) {
+      ++step;
+      continue;
+    }
+
+    const auto step_start = Clock::now();
+    BuildRequestBatch(active, &batch_requests);
+    const auto dense_batch = dense_context.RunBatch(batch_requests);
+    const auto step_end = Clock::now();
+    const double step_ms =
+        std::chrono::duration<double, std::milli>(step_end - step_start).count();
+    stats.run_batch_wall_ms += step_ms;
+    step_ms_values.push_back(step_ms);
+    total_timings.attention_ms += dense_batch.kernel_ms;
+    total_timings.total_ms += dense_batch.kernel_ms;
+    Accumulate(&total_overheads, dense_batch.runtime_overheads);
+    ++nonempty_steps;
+    active_batch_size_sum += static_cast<int>(active.size());
+
+    std::vector<AppendTokenResult> append_results;
+    append_results.reserve(active.size());
+    const int elements_per_token = ElementsPerToken(config);
+    for (auto& active_request : active) {
+      const int request_id = active_request.state.request_id;
+      const int decode_step = active_request.decode_step_index;
+      std::vector<float> generated_key;
+      std::vector<float> generated_value;
+      const float* key_ptr = nullptr;
+      const float* value_ptr = nullptr;
+      if (options.precompute_decode_payloads) {
+        key_ptr = DecodePayloadPtr(
+            decode_payloads.keys[active_request.spec_index],
+            decode_step,
+            elements_per_token);
+        value_ptr = DecodePayloadPtr(
+            decode_payloads.values[active_request.spec_index],
+            decode_step,
+            elements_per_token);
+      } else {
+        generated_key = DeterministicTokenVector(
+            elements_per_token, request_id, decode_step, 1);
+        generated_value = DeterministicTokenVector(
+            elements_per_token, request_id, decode_step, 2);
+        key_ptr = generated_key.data();
+        value_ptr = generated_value.data();
+      }
+      const auto append_result =
+          cache.AppendToken(request_id, key_ptr, value_ptr, false);
+      if (active_request.remaining_decode_steps > 1) {
+        append_results.push_back(append_result);
+      }
+      ++active_request.state.context_tokens;
+      RefreshRequestPages(&cache, &active_request);
+      if (options.precompute_decode_payloads) {
+        const float* next_query = DecodePayloadPtr(
+            decode_payloads.next_queries[active_request.spec_index],
+            decode_step,
+            elements_per_token);
+        active_request.state.query.assign(
+            next_query, next_query + elements_per_token);
+      } else {
+        active_request.state.query = DeterministicTokenVector(
+            elements_per_token, request_id, decode_step + 1, 0);
+      }
+      ++active_request.decode_step_index;
+      --active_request.remaining_decode_steps;
+      ++stats.total_generated_tokens;
+    }
+
+    const auto append_sync_start = Clock::now();
+    dense_context.SyncAppendedTokens(cache, append_results);
+    const auto append_sync_end = Clock::now();
+    stats.append_sync_ms +=
+        std::chrono::duration<double, std::milli>(
+            append_sync_end - append_sync_start).count();
+
+    std::vector<PageId> released_pages;
+    active.erase(
+        std::remove_if(
+            active.begin(),
+            active.end(),
+            [&](const ActiveDecodeRequest& request) {
+              if (request.remaining_decode_steps > 0) {
+                return false;
+              }
+              auto request_pages = cache.ReleaseRequest(request.state.request_id);
+              released_pages.insert(
+                  released_pages.end(), request_pages.begin(), request_pages.end());
+              return true;
+            }),
+        active.end());
+    const auto release_sync_start = Clock::now();
+    if (!options.lazy_release) {
+      dense_context.SyncFreedPages(released_pages);
+    }
+    const auto release_sync_end = Clock::now();
+    stats.release_sync_ms +=
+        std::chrono::duration<double, std::milli>(
+            release_sync_end - release_sync_start).count();
+    ++step;
+  }
+
+  const auto wall_end = Clock::now();
+  stats.total_wall_ms =
+      std::chrono::duration<double, std::milli>(wall_end - wall_start).count();
+  stats.tokens_per_second =
+      stats.total_wall_ms > 0.0
+          ? static_cast<double>(stats.total_generated_tokens) /
+                (stats.total_wall_ms / 1000.0)
+          : 0.0;
+  stats.outside_run_batch_ms = stats.total_wall_ms - stats.run_batch_wall_ms;
+  if (stats.outside_run_batch_ms < 0.0) {
+    stats.outside_run_batch_ms = 0.0;
+  }
+  stats.serving_loop_other_ms =
+      stats.total_wall_ms - stats.run_batch_wall_ms -
+      stats.runtime_admission_ms - stats.append_sync_ms -
+      stats.release_sync_ms;
+  if (stats.serving_loop_other_ms < 0.0) {
+    stats.serving_loop_other_ms = 0.0;
+  }
+  stats.measured_end_to_end_ms =
+      stats.decode_payload_prep_ms + stats.prompt_preadmit_ms +
+      stats.total_wall_ms;
   stats.avg_step_ms =
       step_ms_values.empty()
           ? 0.0
