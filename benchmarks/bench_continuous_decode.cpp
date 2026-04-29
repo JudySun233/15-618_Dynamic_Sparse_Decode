@@ -1,4 +1,8 @@
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <streambuf>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -6,6 +10,7 @@
 
 #include "dsd/config.h"
 #include "dsd/continuous_batching.h"
+#include "dsd/cuda_dense_attention.h"
 #include "dsd/cuda_sparse_attention.h"
 
 namespace {
@@ -93,16 +98,50 @@ const char* TimingModeName(dsd::SparseBatchTimingMode mode) {
   return "unknown";
 }
 
+enum class BenchmarkMode {
+  kSparse = 0,
+  kDenseGpu = 1,
+};
+
+BenchmarkMode ParseBenchmarkMode(int value) {
+  switch (value) {
+    case 0:
+      return BenchmarkMode::kSparse;
+    case 1:
+      return BenchmarkMode::kDenseGpu;
+    default:
+      throw std::invalid_argument("benchmark_mode must be 0=sparse or 1=dense_gpu");
+  }
+}
+
+const char* BenchmarkModeName(BenchmarkMode mode) {
+  switch (mode) {
+    case BenchmarkMode::kSparse:
+      return "sparse";
+    case BenchmarkMode::kDenseGpu:
+      return "dense_gpu";
+  }
+  return "unknown";
+}
+
 void PrintStats(const std::string& label, const dsd::ContinuousBatchStats& stats) {
   std::cout << label << "_total_ms=" << stats.total_wall_ms << "\n";
+  std::cout << label << "_measured_end_to_end_ms="
+            << stats.measured_end_to_end_ms << "\n";
   std::cout << label << "_tokens_per_second=" << stats.tokens_per_second << "\n";
   std::cout << label << "_admission_ms=" << stats.admission_ms << "\n";
+  std::cout << label << "_prompt_preadmit_ms="
+            << stats.prompt_preadmit_ms << "\n";
+  std::cout << label << "_runtime_admission_ms="
+            << stats.runtime_admission_ms << "\n";
   std::cout << label << "_append_sync_ms=" << stats.append_sync_ms << "\n";
   std::cout << label << "_release_sync_ms=" << stats.release_sync_ms << "\n";
   std::cout << label << "_decode_payload_prep_ms="
             << stats.decode_payload_prep_ms << "\n";
   std::cout << label << "_run_batch_wall_ms=" << stats.run_batch_wall_ms << "\n";
   std::cout << label << "_outside_run_batch_ms=" << stats.outside_run_batch_ms << "\n";
+  std::cout << label << "_serving_loop_other_ms="
+            << stats.serving_loop_other_ms << "\n";
   std::cout << label << "_avg_step_ms=" << stats.avg_step_ms << "\n";
   std::cout << label << "_p50_step_ms=" << stats.p50_step_ms << "\n";
   std::cout << label << "_p95_step_ms=" << stats.p95_step_ms << "\n";
@@ -149,7 +188,7 @@ int main(int argc, char** argv) {
   const int head_dim = ReadArgOrDefault(argc, argv, 10, 128);
   const int page_size = ReadArgOrDefault(argc, argv, 11, 16);
   const int top_k_pages = ReadArgOrDefault(argc, argv, 12, 8);
-  const int admission_mode_arg = ReadArgOrDefault(argc, argv, 13, 0);
+  const int admission_mode_arg = ReadArgOrDefault(argc, argv, 13, 1);
   const bool preadmit_prompts = ReadArgOrDefault(argc, argv, 14, 0) != 0;
   const bool precompute_decode_payloads =
       ReadArgOrDefault(argc, argv, 15, 0) != 0;
@@ -160,6 +199,8 @@ int main(int argc, char** argv) {
       ParseOutputMode(ReadArgOrDefault(argc, argv, 18, 1));
   const auto run_batch_timing_mode =
       ParseTimingMode(ReadArgOrDefault(argc, argv, 19, 1));
+  const auto benchmark_mode =
+      ParseBenchmarkMode(ReadArgOrDefault(argc, argv, 20, 0));
   const auto admission_mode = ParseAdmissionMode(admission_mode_arg);
 
   dsd::ModelConfig config;
@@ -192,13 +233,25 @@ int main(int argc, char** argv) {
             << OutputModeName(run_batch_output_mode) << "\n";
   std::cout << "run_batch_timing_mode="
             << TimingModeName(run_batch_timing_mode) << "\n";
+  std::cout << "benchmark_mode=" << BenchmarkModeName(benchmark_mode) << "\n";
 
-  if (!dsd::SparseAttentionCudaAvailable()) {
+  if (benchmark_mode == BenchmarkMode::kSparse &&
+      !dsd::SparseAttentionCudaAvailable()) {
     std::cout << "continuous_sparse_available=0\n";
     std::cout << "continuous benchmark skipped: no visible sm90 GPU\n";
     return 0;
   }
-  std::cout << "continuous_sparse_available=1\n";
+  if (benchmark_mode == BenchmarkMode::kDenseGpu &&
+      !dsd::DenseAttentionCudaAvailable()) {
+    std::cout << "continuous_dense_gpu_available=0\n";
+    std::cout << "continuous dense GPU benchmark skipped: no visible CUDA GPU\n";
+    return 0;
+  }
+  if (benchmark_mode == BenchmarkMode::kSparse) {
+    std::cout << "continuous_sparse_available=1\n";
+  } else {
+    std::cout << "continuous_dense_gpu_available=1\n";
+  }
 
   const auto workload = dsd::BuildSyntheticContinuousWorkload(
       config,
@@ -218,8 +271,15 @@ int main(int argc, char** argv) {
   options.lazy_release = lazy_release;
   options.run_batch_output_mode = run_batch_output_mode;
   options.run_batch_timing_mode = run_batch_timing_mode;
-  const auto result = dsd::RunContinuousSparseBenchmark(config, workload, options);
+  if (benchmark_mode == BenchmarkMode::kDenseGpu) {
+    const auto dense_gpu = dsd::RunContinuousDenseGpuDecode(config, workload, options);
+    std::cout << "total_generated_tokens="
+              << dense_gpu.total_generated_tokens << "\n";
+    PrintStats("continuous_dense_gpu", dense_gpu);
+    return 0;
+  }
 
+  const auto result = dsd::RunContinuousSparseBenchmark(config, workload, options);
   std::cout << "total_generated_tokens="
             << result.continuous_sparse.total_generated_tokens << "\n";
   PrintStats("continuous_sparse", result.continuous_sparse);

@@ -35,7 +35,7 @@ enum class ContinuousPromptAdmissionMode {
 struct ContinuousDecodeOptions {
   int max_active_requests = 1;
   ContinuousPromptAdmissionMode prompt_admission_mode =
-      ContinuousPromptAdmissionMode::kCpuCache;
+      ContinuousPromptAdmissionMode::kDirectGpuUpload;
   bool preadmit_prompts = false;
   bool precompute_decode_payloads = false;
   bool gpu_synthetic_decode_append = false;
@@ -55,11 +55,15 @@ struct ContinuousBatchStats {
   double tokens_per_second = 0.0;
   double avg_active_batch_size = 0.0;
   double admission_ms = 0.0;
+  double prompt_preadmit_ms = 0.0;
+  double runtime_admission_ms = 0.0;
   double append_sync_ms = 0.0;
   double release_sync_ms = 0.0;
   double decode_payload_prep_ms = 0.0;
   double run_batch_wall_ms = 0.0;
   double outside_run_batch_ms = 0.0;
+  double serving_loop_other_ms = 0.0;
+  double measured_end_to_end_ms = 0.0;
   StageTimings avg_sparse_timings;
   RuntimeOverheadTimings avg_runtime_overheads;
   DeviceTransferStats device_transfer_stats;
@@ -88,6 +92,16 @@ ContinuousBatchStats RunContinuousSparseDecode(
     int max_active_requests);
 
 ContinuousBatchStats RunContinuousSparseDecode(
+    const ModelConfig& config,
+    const std::vector<ContinuousRequestSpec>& requests,
+    const ContinuousDecodeOptions& options);
+
+ContinuousBatchStats RunContinuousDenseGpuDecode(
+    const ModelConfig& config,
+    const std::vector<ContinuousRequestSpec>& requests,
+    int max_active_requests);
+
+ContinuousBatchStats RunContinuousDenseGpuDecode(
     const ModelConfig& config,
     const std::vector<ContinuousRequestSpec>& requests,
     const ContinuousDecodeOptions& options);
