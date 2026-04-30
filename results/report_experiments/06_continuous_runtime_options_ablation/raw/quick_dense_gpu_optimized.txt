@@ -1,0 +1,22 @@
+num_requests=32
+max_active_requests=8
+arrival_window=16
+min_prompt_tokens=256
+max_prompt_tokens=512
+min_decode_steps=4
+max_decode_steps=8
+seed=7
+num_heads=32
+head_dim=128
+page_size=16
+top_k_pages=8
+admission_mode=direct_gpu_upload
+preadmit_prompts=1
+precompute_decode_payloads=1
+gpu_synthetic_decode_append=1
+lazy_release=1
+run_batch_output_mode=outputs_only
+run_batch_timing_mode=kernel_events
+benchmark_mode=dense_gpu
+continuous_dense_gpu_available=0
+continuous dense GPU benchmark skipped: no visible CUDA GPU

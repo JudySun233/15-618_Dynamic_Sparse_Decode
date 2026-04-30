@@ -1,0 +1,51 @@
+
+== Decode Benchmark ==
+batch_size=16 total_pages=4096 top_k_pages=8 num_heads=32 head_dim=128 page_size=16 min_ctx=4096 max_ctx=4096 seed=7 iterations=10 warmup=2
+
+== Analytical Ceiling ==
+total_context_tokens=65536 total_candidate_pages=4096 total_selected_tokens=2048
+Path               Bytes(MB)    FLOPs(M)          AI   BwFloor(us)  CmpFloor(us)
+--------------------------------------------------------------------------------
+dense               2147.484    1073.742       0.500       641.040        16.026
+sparse_current      1275.068      67.109       0.053       380.617         1.002
+sparse_target        134.218      67.109       0.500        40.065         1.002
+sparse_current_over_dense_bytes=0.594 sparse_target_over_dense_bytes=0.062
+
+== End-to-End ==
+Path             Total(ms)       Speedup  Note
+------------------------------------------------------------------------
+dense_cpu         1175.856         1.000  reference wall time
+sparse_cpu          34.565        34.019  naive sparse pipeline
+dense_gpu            5.406       217.493  batch wall time
+sparse_gpu           0.464      2533.184  batched sparse GPU path
+
+== Stage / Kernel Breakdown ==
+Path               Score        TopK      Gather      Attend     GPUKernel  Note
+--------------------------------------------------------------------------------------
+dense_cpu          0.000       0.000       0.000    1175.853         0.000  attention only
+sparse_cpu        14.784       0.037      13.126       6.612         0.000  full CPU stage split
+dense_gpu          0.000       0.000       0.000       5.122         5.122  attention kernel only
+sparse_gpu         0.041       0.035       0.000       0.162         0.238  GPU score/top-k + fused attend
+
+== Runtime Overheads ==
+Path              Malloc         H2D         D2H        Free        Launch        Sync  SparseLayout     TotalOH  Note
+--------------------------------------------------------------------------------------------------------------------------
+dense_cpu          0.000       0.000       0.000       0.000         0.000       0.000         0.000       0.000  CPU path
+sparse_cpu         0.000       0.000       0.000       0.000         0.000       0.000         0.000       0.000  CPU path
+dense_gpu          0.046       0.059       0.062       0.017         0.013       5.113         0.000       5.309  dense CUDA runtime
+sparse_gpu         0.000       0.037       0.063       0.000         0.018       0.227         0.050       0.394  sparse CUDA runtime
+
+== Accuracy ==
+avg_max_abs_diff_sparse_cpu_vs_dense_cpu=1.998816e-01
+avg_max_abs_diff_sparse_gpu_vs_sparse_cpu=1.206063e-07
+avg_max_abs_diff_sparse_gpu_vs_dense_cpu=1.998816e-01
+avg_max_abs_diff_dense_gpu_vs_dense_cpu=1.176959e-07
+
+== Reading Guide ==
+End-to-End Total(ms) is the full wall time for that path.
+Speedup is dense_cpu_total_ms / path_total_ms.
+Stage / Kernel Breakdown shows compute-stage timings only.
+Runtime Overheads breaks out malloc/memcpy/free, kernel launch, sync, and sparse metadata preparation.
+Analytical Ceiling reports byte/flop lower bounds against H100 peak bandwidth and FP32 throughput.
+For sparse_gpu, Gather is fused into attention in the fast path, so gather_ms is expected to be zero.
+For dense_gpu, Attend and GPUKernel are both the measured CUDA dense-attention kernel time.

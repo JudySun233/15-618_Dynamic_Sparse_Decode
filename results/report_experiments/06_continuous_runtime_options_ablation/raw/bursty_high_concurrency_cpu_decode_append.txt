@@ -1,0 +1,22 @@
+num_requests=256
+max_active_requests=64
+arrival_window=0
+min_prompt_tokens=1024
+max_prompt_tokens=4096
+min_decode_steps=16
+max_decode_steps=64
+seed=7
+num_heads=32
+head_dim=128
+page_size=16
+top_k_pages=8
+admission_mode=direct_gpu_upload
+preadmit_prompts=1
+precompute_decode_payloads=1
+gpu_synthetic_decode_append=0
+lazy_release=1
+run_batch_output_mode=outputs_only
+run_batch_timing_mode=kernel_events
+benchmark_mode=sparse
+continuous_sparse_available=0
+continuous benchmark skipped: no visible sm90 GPU
