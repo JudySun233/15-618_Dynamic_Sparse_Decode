@@ -1,6 +1,5 @@
 build/
 build*/
-results/
 *.o
 *.so
 *.a
